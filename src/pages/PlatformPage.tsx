@@ -1112,7 +1112,7 @@ export function PlatformPage() {
         </div>
       ) : null}
 
-      <div
+      {/* <div
         style={{
           flexShrink: 0,
           display: 'flex',
@@ -1169,7 +1169,7 @@ export function PlatformPage() {
         {!showTradeForm && tradeError ? (
           <span style={{ color: '#f87171', fontSize: 12, width: '100%' }}>{tradeError}</span>
         ) : null}
-      </div>
+      </div> */}
 
       <div
         style={{
@@ -1213,128 +1213,129 @@ export function PlatformPage() {
         />
         {selectedTradeId ? (
           hideTpSlDragHint ? (
-            <div
-              style={{
-                position: 'absolute',
-                right: 12,
-                top: 10,
-                zIndex: 1100,
-                pointerEvents: 'auto',
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'flex-end',
-                gap: 8,
-              }}
-            >
-              <div
-                style={{
-                  display: 'flex',
-                  flexWrap: 'wrap',
-                  gap: 6,
-                  justifyContent: 'flex-end',
-                  maxWidth: 'min(280px, 100%)',
-                }}
-              >
-                <button
-                  type="button"
-                  disabled={!selectedTrade || selectedTrade.tpPrice != null}
-                  onClick={() => selectedTradeId && addTradeTp(selectedTradeId)}
-                  style={{
-                    padding: '6px 10px',
-                    borderRadius: 8,
-                    fontSize: 11,
-                    fontWeight: 600,
-                    cursor:
-                      !selectedTrade || selectedTrade.tpPrice != null ? 'not-allowed' : 'pointer',
-                    border: '1px solid #14532d',
-                    background: '#052e16',
-                    color: '#bbf7d0',
-                    opacity: !selectedTrade || selectedTrade.tpPrice != null ? 0.4 : 1,
-                    WebkitTapHighlightColor: 'transparent',
-                  }}
-                >
-                  Add TP
-                </button>
-                <button
-                  type="button"
-                  disabled={!selectedTrade || selectedTrade.tpPrice == null}
-                  onClick={() => selectedTradeId && removeTradeTp(selectedTradeId)}
-                  style={{
-                    padding: '6px 10px',
-                    borderRadius: 8,
-                    fontSize: 11,
-                    fontWeight: 600,
-                    cursor:
-                      !selectedTrade || selectedTrade.tpPrice == null ? 'not-allowed' : 'pointer',
-                    border: '1px solid #3f6212',
-                    background: '#1a2e05',
-                    color: '#d9f99d',
-                    opacity: !selectedTrade || selectedTrade.tpPrice == null ? 0.4 : 1,
-                    WebkitTapHighlightColor: 'transparent',
-                  }}
-                >
-                  Remove TP
-                </button>
-                <button
-                  type="button"
-                  disabled={!selectedTrade || selectedTrade.slPrice != null}
-                  onClick={() => selectedTradeId && addTradeSl(selectedTradeId)}
-                  style={{
-                    padding: '6px 10px',
-                    borderRadius: 8,
-                    fontSize: 11,
-                    fontWeight: 600,
-                    cursor:
-                      !selectedTrade || selectedTrade.slPrice != null ? 'not-allowed' : 'pointer',
-                    border: '1px solid #991b1b',
-                    background: '#450a0a',
-                    color: '#fecaca',
-                    opacity: !selectedTrade || selectedTrade.slPrice != null ? 0.4 : 1,
-                    WebkitTapHighlightColor: 'transparent',
-                  }}
-                >
-                  Add SL
-                </button>
-                <button
-                  type="button"
-                  disabled={!selectedTrade || selectedTrade.slPrice == null}
-                  onClick={() => selectedTradeId && removeTradeSl(selectedTradeId)}
-                  style={{
-                    padding: '6px 10px',
-                    borderRadius: 8,
-                    fontSize: 11,
-                    fontWeight: 600,
-                    cursor:
-                      !selectedTrade || selectedTrade.slPrice == null ? 'not-allowed' : 'pointer',
-                    border: '1px solid #7f1d1d',
-                    background: '#2d1212',
-                    color: '#fecaca',
-                    opacity: !selectedTrade || selectedTrade.slPrice == null ? 0.4 : 1,
-                    WebkitTapHighlightColor: 'transparent',
-                  }}
-                >
-                  Remove SL
-                </button>
-              </div>
-              <button
-                type="button"
-                onClick={() => setSelectedTradeId(null)}
-                style={{
-                  padding: '8px 14px',
-                  borderRadius: 10,
-                  border: '1px solid #404040',
-                  background: 'rgba(23,23,23,0.96)',
-                  color: '#fafafa',
-                  fontWeight: 600,
-                  fontSize: 12,
-                  cursor: 'pointer',
-                  boxShadow: '0 8px 20px rgba(0,0,0,0.35)',
-                  WebkitTapHighlightColor: 'transparent',
-                }}
-              >
-                Done
-              </button>
-            </div>
+            <></>
+            // <div
+            //   style={{
+            //     position: 'absolute',
+            //     right: 12,
+            //     top: 10,
+            //     zIndex: 1100,
+            //     pointerEvents: 'auto',
+            //     display: 'flex',
+            //     flexDirection: 'column',
+            //     alignItems: 'flex-end',
+            //     gap: 8,
+            //   }}
+            // >
+            //   <div
+            //     style={{
+            //       display: 'flex',
+            //       flexWrap: 'wrap',
+            //       gap: 6,
+            //       justifyContent: 'flex-end',
+            //       maxWidth: 'min(280px, 100%)',
+            //     }}
+            //   >
+            //     <button
+            //       type="button"
+            //       disabled={!selectedTrade || selectedTrade.tpPrice != null}
+            //       onClick={() => selectedTradeId && addTradeTp(selectedTradeId)}
+            //       style={{
+            //         padding: '6px 10px',
+            //         borderRadius: 8,
+            //         fontSize: 11,
+            //         fontWeight: 600,
+            //         cursor:
+            //           !selectedTrade || selectedTrade.tpPrice != null ? 'not-allowed' : 'pointer',
+            //         border: '1px solid #14532d',
+            //         background: '#052e16',
+            //         color: '#bbf7d0',
+            //         opacity: !selectedTrade || selectedTrade.tpPrice != null ? 0.4 : 1,
+            //         WebkitTapHighlightColor: 'transparent',
+            //       }}
+            //     >
+            //       Add TP
+            //     </button>
+            //     <button
+            //       type="button"
+            //       disabled={!selectedTrade || selectedTrade.tpPrice == null}
+            //       onClick={() => selectedTradeId && removeTradeTp(selectedTradeId)}
+            //       style={{
+            //         padding: '6px 10px',
+            //         borderRadius: 8,
+            //         fontSize: 11,
+            //         fontWeight: 600,
+            //         cursor:
+            //           !selectedTrade || selectedTrade.tpPrice == null ? 'not-allowed' : 'pointer',
+            //         border: '1px solid #3f6212',
+            //         background: '#1a2e05',
+            //         color: '#d9f99d',
+            //         opacity: !selectedTrade || selectedTrade.tpPrice == null ? 0.4 : 1,
+            //         WebkitTapHighlightColor: 'transparent',
+            //       }}
+            //     >
+            //       Remove TP
+            //     </button>
+            //     <button
+            //       type="button"
+            //       disabled={!selectedTrade || selectedTrade.slPrice != null}
+            //       onClick={() => selectedTradeId && addTradeSl(selectedTradeId)}
+            //       style={{
+            //         padding: '6px 10px',
+            //         borderRadius: 8,
+            //         fontSize: 11,
+            //         fontWeight: 600,
+            //         cursor:
+            //           !selectedTrade || selectedTrade.slPrice != null ? 'not-allowed' : 'pointer',
+            //         border: '1px solid #991b1b',
+            //         background: '#450a0a',
+            //         color: '#fecaca',
+            //         opacity: !selectedTrade || selectedTrade.slPrice != null ? 0.4 : 1,
+            //         WebkitTapHighlightColor: 'transparent',
+            //       }}
+            //     >
+            //       Add SL
+            //     </button>
+            //     <button
+            //       type="button"
+            //       disabled={!selectedTrade || selectedTrade.slPrice == null}
+            //       onClick={() => selectedTradeId && removeTradeSl(selectedTradeId)}
+            //       style={{
+            //         padding: '6px 10px',
+            //         borderRadius: 8,
+            //         fontSize: 11,
+            //         fontWeight: 600,
+            //         cursor:
+            //           !selectedTrade || selectedTrade.slPrice == null ? 'not-allowed' : 'pointer',
+            //         border: '1px solid #7f1d1d',
+            //         background: '#2d1212',
+            //         color: '#fecaca',
+            //         opacity: !selectedTrade || selectedTrade.slPrice == null ? 0.4 : 1,
+            //         WebkitTapHighlightColor: 'transparent',
+            //       }}
+            //     >
+            //       Remove SL
+            //     </button>
+            //   </div>
+            //   <button
+            //     type="button"
+            //     onClick={() => setSelectedTradeId(null)}
+            //     style={{
+            //       padding: '8px 14px',
+            //       borderRadius: 10,
+            //       border: '1px solid #404040',
+            //       background: 'rgba(23,23,23,0.96)',
+            //       color: '#fafafa',
+            //       fontWeight: 600,
+            //       fontSize: 12,
+            //       cursor: 'pointer',
+            //       boxShadow: '0 8px 20px rgba(0,0,0,0.35)',
+            //       WebkitTapHighlightColor: 'transparent',
+            //     }}
+            //   >
+            //     Done
+            //   </button>
+            // </div>
           ) : (
             <div
               role="status"
@@ -1375,7 +1376,7 @@ export function PlatformPage() {
                     line to switch which trade you are editing. <strong>Add TP / Add SL</strong> restores the default
                     ±0.5% levels from entry; you can still drag the entry line to set them instead.
                   </div>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
+                  {/* <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
                     <button
                       type="button"
                       disabled={!selectedTrade || selectedTrade.tpPrice != null}
@@ -1456,7 +1457,7 @@ export function PlatformPage() {
                     >
                       Remove SL
                     </button>
-                  </div>
+                  </div> */}
                   <label
                     style={{
                       display: 'flex',
@@ -1481,7 +1482,7 @@ export function PlatformPage() {
                     Don&apos;t show this again
                   </label>
                 </div>
-                <button
+                {/* <button
                   type="button"
                   onClick={() => setSelectedTradeId(null)}
                   style={{
@@ -1498,7 +1499,7 @@ export function PlatformPage() {
                   }}
                 >
                   Done
-                </button>
+                </button> */}
               </div>
             </div>
           )

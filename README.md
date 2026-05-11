@@ -71,3 +71,6 @@ export default defineConfig([
   },
 ])
 ```
+
+docker build -t trading-platform .
+docker run -d -p 5173:5173 --name trading-platform --restart always trading-platform
