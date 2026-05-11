@@ -114,6 +114,16 @@ function formatMtPrice(value: number): { head: string; sup: string } {
   return { head: `${intPart}.${dec[0]}`, sup: dec[1] }
 }
 
+/** Client-side trade id without `crypto.randomUUID` (non-secure origins / older runtimes). */
+function createTradeId(): string {
+  const t = Date.now().toString(36)
+  const randHex = () =>
+    Math.floor((1 + Math.random()) * 0x1000_0000)
+      .toString(16)
+      .slice(1)
+  return `${t}-${randHex()}-${randHex()}`
+}
+
 /** Same synthetic half-spread as the order strip (mid ± half → bid / ask). */
 function syntheticHalfSpread(mid: number): number {
   const tick = Math.max(mid * 0.00004, mid > 1000 ? 0.01 : 0.0001)
@@ -778,7 +788,7 @@ export function PlatformPage() {
     const slPrice = defaultSlPrice(side, entryPrice)
 
     const historyItem = {
-      id: crypto.randomUUID(),
+      id: createTradeId(),
       side,
       symbol,
       lotSize: parsed,
@@ -967,7 +977,6 @@ export function PlatformPage() {
               display: 'flex',
               flexDirection: 'row',
               alignItems: 'stretch',
-              minHeight: 78,
               borderBottom: '1px solid #1f1f1f',
             }}
           >
@@ -988,11 +997,11 @@ export function PlatformPage() {
               className="flex w-[min(42vw,158px)] shrink-0 flex-col justify-center gap-1.5 border-x border-neutral-800 bg-[#050505] px-2.5 py-2"
               style={{ WebkitTapHighlightColor: 'transparent' }}
             >
-              <div className="text-center">
+              {/* <div className="text-center">
                 <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-neutral-500">
                   Lot size
                 </span>
-              </div>
+              </div> */}
               <div className="flex min-h-[40px] items-center gap-0.5 rounded-lg border border-neutral-800/90 bg-gradient-to-b from-neutral-900/50 to-neutral-950 px-0.5 py-0.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] transition-[box-shadow,border-color] focus-within:border-sky-600/45 focus-within:shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_0_1px_rgba(14,165,233,0.22)]">
                 <button
                   type="button"
@@ -1049,7 +1058,7 @@ export function PlatformPage() {
                   </svg>
                 </button>
               </div>
-              <div className="grid grid-cols-4 gap-1">
+              {/* <div className="grid grid-cols-4 gap-1">
                 {(
                   [
                     { label: '−0.1', delta: -0.1 },
@@ -1068,10 +1077,10 @@ export function PlatformPage() {
                     {label}
                   </button>
                 ))}
-              </div>
-              <div className="truncate text-center text-[10px] font-medium tracking-tight text-neutral-600">
+              </div> */}
+              {/* <div className="truncate text-center text-[10px] font-medium tracking-tight text-neutral-600">
                 {symbol}
-              </div>
+              </div> */}
             </div>
             <button
               type="button"
@@ -1497,27 +1506,28 @@ export function PlatformPage() {
           </div>
 
           {lastTrade ? (
-            <div
-              style={{
-                position: 'absolute',
-                right: 10,
-                top: 10,
-                padding: 10,
-                background: 'rgba(30,30,30,0.95)',
-                border: '1px solid #404040',
-                borderRadius: 8,
-                color: '#e5e5e5',
-                fontSize: 12,
-                whiteSpace: 'pre-wrap',
-                zIndex: 800,
-              }}
-            >
-              <div style={{ fontWeight: 700, marginBottom: 4 }}>Last trade (local)</div>
-              <div>
-                {lastTrade.side} {lastTrade.symbol} lotSize={lastTrade.lotSize}
-              </div>
-              <div style={{ color: '#a3a3a3' }}>{lastTrade.atIso}</div>
-            </div>
+            <></>
+            // <div
+            //   style={{
+            //     position: 'absolute',
+            //     right: 10,
+            //     top: 10,
+            //     padding: 10,
+            //     background: 'rgba(30,30,30,0.95)',
+            //     border: '1px solid #404040',
+            //     borderRadius: 8,
+            //     color: '#e5e5e5',
+            //     fontSize: 12,
+            //     whiteSpace: 'pre-wrap',
+            //     zIndex: 800,
+            //   }}
+            // >
+            //   <div style={{ fontWeight: 700, marginBottom: 4 }}>Last trade (local)</div>
+            //   <div>
+            //     {lastTrade.side} {lastTrade.symbol} lotSize={lastTrade.lotSize}
+            //   </div>
+            //   <div style={{ color: '#a3a3a3' }}>{lastTrade.atIso}</div>
+            // </div>
           ) : null}
         </div>
 
