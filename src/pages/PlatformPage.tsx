@@ -1074,13 +1074,16 @@ export function PlatformPage() {
         const chart = createChart(containerRef.current, {
           width: containerRef.current.clientWidth,
           height: containerRef.current.clientHeight,
-          layout: { background: { color: '#ffffff' }, textColor: '#111827' },
-          grid: {
-            vertLines: { color: '#e5e7eb' },
-            horzLines: { color: '#e5e7eb' },
+          layout: {
+            background: { color: '#1a1a1a' },
+            textColor: '#d4d4d4',
           },
-          rightPriceScale: { borderColor: '#e5e7eb' },
-          timeScale: { borderColor: '#e5e7eb' },
+          grid: {
+            vertLines: { color: '#2e2e2e' },
+            horzLines: { color: '#2e2e2e' },
+          },
+          rightPriceScale: { borderColor: '#3f3f3f' },
+          timeScale: { borderColor: '#3f3f3f' },
           crosshair: { mode: CrosshairMode.Normal },
         })
 
