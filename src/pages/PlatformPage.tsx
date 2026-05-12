@@ -23,14 +23,14 @@ import type {
 const META_TRADER_SOUND_URL = '/metatrader.mp3'
 let metaTraderSoundAudio: HTMLAudioElement | null = null
 
-const VITE_SIGNALR_URL="http://localhost:5104/stream"
+const VITE_SIGNALR_URL="http://46.249.99.130:5104:5104/stream"
 const VITE_SIGNALR_ACCOUNT="5049518877"
 const VITE_SIGNALR_TERMINAL="MT5"
 const VITE_SIGNALR_SYMBOL="XAUUSD"
 const VITE_TERMINAL_TYPE="1"
 const VITE_OHLC_TIMEFRAME="1"
 const VITE_OHLC_HISTORY_DAYS="14"
-const VITE_OHLC_URL="http://localhost:5104/Manage/ohlc"
+const VITE_OHLC_URL="http://46.249.99.130:5104:5104/Manage/ohlc"
 
 function playMetaTraderTradeSound() {
   if (typeof window === 'undefined') return
