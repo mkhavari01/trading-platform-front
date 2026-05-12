@@ -940,22 +940,7 @@ export function PlatformPage() {
       const series = seriesRef.current
       if (!overlay || !series) return
 
-      const rect = overlay.getBoundingClientRect()
-      const ev = event as PointerEvent | MouseEvent | TouchEvent
-      let clientY: number | undefined
-      let pointerType: string | undefined
-      if ('clientY' in ev && typeof ev.clientY === 'number') {
-        clientY = ev.clientY
-        pointerType = (ev as PointerEvent).pointerType
-      } else if ('touches' in ev && ev.touches.length > 0) {
-        clientY = ev.touches[0].clientY
-        pointerType = 'touch'
-      }
-      if (clientY === undefined) return
-      const y = clientY - rect.top
-
-      const HIT_PX = pointerType === 'touch' ? 28 : 16
-
+      /** `touchend` has no `touches`; use `changedTouches` (mobile was skipping `last` → no `setSlTp`). */
       if (last) {
         const ended = draggingRef.current
         const didMutate = tpSlDragMutatedRef.current
@@ -973,6 +958,28 @@ export function PlatformPage() {
         }
         return
       }
+
+      const rect = overlay.getBoundingClientRect()
+      const ev = event as PointerEvent | MouseEvent | TouchEvent
+      let clientY: number | undefined
+      let pointerType: string | undefined
+      if ('clientY' in ev && typeof ev.clientY === 'number') {
+        clientY = ev.clientY
+        pointerType = (ev as PointerEvent).pointerType
+      } else if ('touches' in ev) {
+        const te = ev as TouchEvent
+        if (te.touches.length > 0) {
+          clientY = te.touches[0].clientY
+          pointerType = 'touch'
+        } else if (te.changedTouches.length > 0) {
+          clientY = te.changedTouches[0].clientY
+          pointerType = 'touch'
+        }
+      }
+      if (clientY === undefined) return
+      const y = clientY - rect.top
+
+      const HIT_PX = pointerType === 'touch' ? 28 : 16
 
       if (first) {
         if (series.coordinateToPrice(y) == null) return
@@ -1074,16 +1081,13 @@ export function PlatformPage() {
         const chart = createChart(containerRef.current, {
           width: containerRef.current.clientWidth,
           height: containerRef.current.clientHeight,
-          layout: {
-            background: { color: '#1a1a1a' },
-            textColor: '#d4d4d4',
-          },
+          layout: { background: { color: '#ffffff' }, textColor: '#111827' },
           grid: {
-            vertLines: { color: '#2e2e2e' },
-            horzLines: { color: '#2e2e2e' },
+            vertLines: { color: '#e5e7eb' },
+            horzLines: { color: '#e5e7eb' },
           },
-          rightPriceScale: { borderColor: '#3f3f3f' },
-          timeScale: { borderColor: '#3f3f3f' },
+          rightPriceScale: { borderColor: '#e5e7eb' },
+          timeScale: { borderColor: '#e5e7eb' },
           crosshair: { mode: CrosshairMode.Normal },
         })
 
