@@ -342,6 +342,34 @@ function tradeResultLooksFailed(parsed: Record<string, unknown>): boolean {
   return false
 }
 
+const LOT_FRACTION_MAX_DIGITS = 2
+
+/** Lot field must not have more than 2 digits after the decimal (e.g. 0.001 invalid). */
+function lotStringHasAtMostTwoDecimalPlaces(raw: string): boolean {
+  const t = raw.trim().replace(',', '.')
+  if (t === '' || t === '.') return true
+  if (!/^\d*\.?\d*$/.test(t)) return false
+  const dot = t.indexOf('.')
+  if (dot === -1) return true
+  return t.length - dot - 1 <= LOT_FRACTION_MAX_DIGITS
+}
+
+function roundLotsToTwoDecimals(n: number): number {
+  return Math.round(n * 100) / 100
+}
+
+/** XAUUSD: 0.01 lot = 1 oz, 1 lot = 100 oz. P/L in price units × oz (USD if quote is USD/oz). */
+function xauusdOpenPnlFromMid(
+  side: 'BUY' | 'SELL',
+  openPrice: number,
+  currentMid: number,
+  lots: number,
+): number {
+  const ounces = lots * 100
+  const diff = side === 'BUY' ? currentMid - openPrice : openPrice - currentMid
+  return diff * ounces
+}
+
 type MtOhlcRow = {
   time: string
   open: number
@@ -602,6 +630,7 @@ export function PlatformPage() {
   const [historyCloseModal, setHistoryCloseModal] = useState<MtServerOpenPosition | null>(null)
   const [historyCloseStep, setHistoryCloseStep] = useState<'choose' | 'partial'>('choose')
   const [partialCloseLotsInput, setPartialCloseLotsInput] = useState('')
+  const [partialCloseLotsError, setPartialCloseLotsError] = useState<string | null>(null)
 
   const sampleCandles = useMemo(() => generateSampleCandles(), [])
 
@@ -1602,6 +1631,10 @@ export function PlatformPage() {
 
   const submitTrade = (side: 'BUY' | 'SELL') => {
     setTradeError(null)
+    if (!lotStringHasAtMostTwoDecimalPlaces(lotSize)) {
+      setTradeError('Lot size can use at most 2 decimal places (e.g. 0.01 or 1.25). Values like 0.001 are not allowed.')
+      return
+    }
     const parsed = Number(lotSize)
     if (!Number.isFinite(parsed) || parsed <= 0) {
       setTradeError('Lot size must be a positive number.')
@@ -1693,6 +1726,10 @@ export function PlatformPage() {
     const lots =
       mode === 'full' ? pos.lots : Number(String(partialCloseLotsInput).replace(',', '.'))
     if (mode === 'partial') {
+      if (!lotStringHasAtMostTwoDecimalPlaces(partialCloseLotsInput)) {
+        setTradeError('Lot size can use at most 2 decimal places (e.g. 0.01 or 1.25).')
+        return
+      }
       if (!Number.isFinite(lots) || lots <= 0) {
         setTradeError('Enter a valid lot size to close.')
         return
@@ -1723,6 +1760,7 @@ export function PlatformPage() {
     setHistoryCloseModal(null)
     setHistoryCloseStep('choose')
     setPartialCloseLotsInput('')
+    setPartialCloseLotsError(null)
   }
 
   const removeTradeTp = (tradeId: string) => {
@@ -1814,7 +1852,7 @@ export function PlatformPage() {
     setLotSize((prev) => {
       const n = Number(prev)
       const base = Number.isFinite(n) && n > 0 ? n : 0.01
-      const next = Math.max(0.0001, Math.round((base + delta) * 10_000) / 10_000)
+      const next = Math.max(0.01, roundLotsToTwoDecimals(base + delta))
       return String(next)
     })
   }
@@ -1919,15 +1957,21 @@ export function PlatformPage() {
                   spellCheck={false}
                   value={lotSize}
                   onChange={(e) => {
+                    const v = e.target.value
                     setTradeError(null)
-                    setLotSize(e.target.value)
+                    setLotSize(v)
+                    if (v.trim() !== '' && !lotStringHasAtMostTwoDecimalPlaces(v)) {
+                      setTradeError(
+                        'Lot size can use at most 2 decimal places (e.g. 0.01 or 1.25). Values like 0.001 are not allowed.',
+                      )
+                    }
                   }}
                   onBlur={() => {
                     const n = Number(lotSize)
                     if (!Number.isFinite(n) || n <= 0) {
                       setLotSize('0.01')
                     } else {
-                      setLotSize(String(Math.round(n * 10_000) / 10_000))
+                      setLotSize(String(roundLotsToTwoDecimals(n)))
                     }
                   }}
                   className="min-w-0 flex-1 border-0 bg-transparent py-1 text-center text-[17px] font-semibold tabular-nums text-neutral-100 caret-sky-400 outline-none ring-0 placeholder:text-neutral-600"
@@ -2507,12 +2551,27 @@ export function PlatformPage() {
                       </td>
                     </tr>
                   ) : (
-                    serverOpenPositions.map((o) => (
+                    serverOpenPositions.map((o) => {
+                      const chartSym = symbol.trim().toUpperCase()
+                      const isXau = o.symbol.trim().toUpperCase() === 'XAUUSD'
+                      const mid = latestPrice
+                      const clientPnl =
+                        isXau && chartSym === 'XAUUSD' && mid != null
+                          ? xauusdOpenPnlFromMid(
+                              o.type === 0 ? 'BUY' : 'SELL',
+                              o.openPrice,
+                              mid,
+                              o.lots,
+                            )
+                          : null
+                      const displayPnl = clientPnl != null ? clientPnl : o.profit
+                      return (
                       <tr
                         key={o.ticket}
                         onClick={() => {
                           setHistoryCloseStep('choose')
                           setPartialCloseLotsInput('')
+                          setPartialCloseLotsError(null)
                           setHistoryCloseModal(o)
                         }}
                         style={{
@@ -2528,17 +2587,21 @@ export function PlatformPage() {
                         <td
                           style={{
                             padding: '8px 6px',
-                            color: o.profit >= 0 ? '#42a5f5' : '#ef5350',
+                            color: displayPnl >= 0 ? '#42a5f5' : '#ef5350',
                             fontWeight: 600,
                           }}
                         >
-                          {o.profit.toFixed(2)}
+                          {displayPnl.toFixed(2)}
+                          {isXau && clientPnl != null ? (
+                            <span style={{ fontSize: 10, fontWeight: 500, color: '#737373' }}> (est.)</span>
+                          ) : null}
                         </td>
                         <td style={{ padding: '8px 6px', fontSize: 12, color: '#a3a3a3' }}>
                           {o.openTime ? new Date(o.openTime).toLocaleString() : '—'}
                         </td>
                       </tr>
-                    ))
+                      )
+                    })
                   )}
                 </tbody>
               </table>
@@ -2592,7 +2655,7 @@ export function PlatformPage() {
                   )}
                 </tbody>
               </table>
-
+{/* 
               {tradeHistory.length > 0 ? (
                 <>
                   <div style={{ marginTop: 18, fontWeight: 600, color: '#fafafa', fontSize: 13 }}>
@@ -2657,7 +2720,7 @@ export function PlatformPage() {
                     </tbody>
                   </table>
                 </>
-              ) : null}
+              ) : null} */}
             </>
           ) : (
             <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 8, color: '#e5e5e5' }}>
@@ -2795,6 +2858,7 @@ export function PlatformPage() {
             setHistoryCloseModal(null)
             setHistoryCloseStep('choose')
             setPartialCloseLotsInput('')
+            setPartialCloseLotsError(null)
           }}
           style={{
             position: 'fixed',
@@ -2847,7 +2911,10 @@ export function PlatformPage() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setHistoryCloseStep('partial')}
+                  onClick={() => {
+                    setHistoryCloseStep('partial')
+                    setPartialCloseLotsError(null)
+                  }}
                   style={{
                     padding: '10px 12px',
                     borderRadius: 8,
@@ -2866,6 +2933,7 @@ export function PlatformPage() {
                     setHistoryCloseModal(null)
                     setHistoryCloseStep('choose')
                     setPartialCloseLotsInput('')
+                    setPartialCloseLotsError(null)
                   }}
                   style={{
                     padding: '8px 12px',
@@ -2885,7 +2953,19 @@ export function PlatformPage() {
                   Lots to close (max {historyCloseModal.lots})
                   <input
                     value={partialCloseLotsInput}
-                    onChange={(e) => setPartialCloseLotsInput(e.target.value)}
+                    onChange={(e) => {
+                      const v = e.target.value
+                      setPartialCloseLotsInput(v)
+                      if (v.trim() === '') {
+                        setPartialCloseLotsError(null)
+                      } else if (!lotStringHasAtMostTwoDecimalPlaces(v)) {
+                        setPartialCloseLotsError(
+                          'Lot size can use at most 2 decimal places (e.g. 0.01 or 1.25). Values like 0.001 are not allowed.',
+                        )
+                      } else {
+                        setPartialCloseLotsError(null)
+                      }
+                    }}
                     inputMode="decimal"
                     style={{
                       display: 'block',
@@ -2893,13 +2973,16 @@ export function PlatformPage() {
                       marginTop: 6,
                       padding: '8px 10px',
                       borderRadius: 8,
-                      border: '1px solid #404040',
+                      border: `1px solid ${partialCloseLotsError ? '#b91c1c' : '#404040'}`,
                       background: '#0d0d0d',
                       color: '#fafafa',
                       fontSize: 14,
                     }}
                   />
                 </label>
+                {partialCloseLotsError ? (
+                  <div style={{ fontSize: 12, color: '#f87171' }}>{partialCloseLotsError}</div>
+                ) : null}
                 <button
                   type="button"
                   onClick={() => submitServerPositionClose('partial')}
@@ -2917,7 +3000,10 @@ export function PlatformPage() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setHistoryCloseStep('choose')}
+                  onClick={() => {
+                    setHistoryCloseStep('choose')
+                    setPartialCloseLotsError(null)
+                  }}
                   style={{
                     padding: '8px 12px',
                     borderRadius: 8,
