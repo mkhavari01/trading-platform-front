@@ -241,6 +241,98 @@ function brokerTimeToOhlcIso(brokerIso: string): string {
   return new Date(ms).toISOString().slice(0, 19)
 }
 
+function envName(envelope: {
+  name?: string
+  message?: string
+  Name?: string
+  Message?: string
+}): { name: string; message: string } {
+  const name = String(envelope.name ?? envelope.Name ?? '')
+  const message = String(envelope.message ?? envelope.Message ?? '')
+  return { name, message }
+}
+
+type AccountHistorySlice = {
+  userOpenOrders: Record<string, unknown>[]
+  userHistory: Record<string, unknown>[]
+  userDeals: Record<string, unknown>[]
+}
+
+function getHistorySlice(parsed: unknown): AccountHistorySlice | null {
+  if (!parsed || typeof parsed !== 'object') return null
+  const p = parsed as Record<string, unknown>
+  const h = (p.history ?? p.History) as Record<string, unknown> | undefined
+  if (!h || typeof h !== 'object') return null
+  const userOpenOrders = (h.userOpenOrders ?? h.UserOpenOrders ?? []) as unknown[]
+  const userHistory = (h.userHistory ?? h.UserHistory ?? []) as unknown[]
+  const userDeals = (h.userDeals ?? h.UserDeals ?? []) as unknown[]
+  return {
+    userOpenOrders: userOpenOrders.filter((x): x is Record<string, unknown> => x != null && typeof x === 'object'),
+    userHistory: userHistory.filter((x): x is Record<string, unknown> => x != null && typeof x === 'object'),
+    userDeals: userDeals.filter((x): x is Record<string, unknown> => x != null && typeof x === 'object'),
+  }
+}
+
+type MtServerOpenPosition = {
+  ticket: number
+  symbol: string
+  lots: number
+  type: number
+  openPrice: number
+  profit: number
+  openTime: string
+}
+
+type MtServerHistoryRow = {
+  ticket: number
+  symbol: string
+  lots: number
+  type: number
+  openPrice: number
+  closePrice: number
+  profit: number
+  openTime: string
+  closeTime: string
+}
+
+function mapServerOpen(raw: Record<string, unknown>): MtServerOpenPosition | null {
+  const ticket = Number(raw.Ticket ?? raw.ticket)
+  if (!Number.isFinite(ticket)) return null
+  const symbol = String(raw.Symbol ?? raw.symbol ?? '').trim()
+  const lots = Number(raw.Lots ?? raw.Volume ?? raw.lots ?? raw.volume ?? 0)
+  const type = Number(raw.Type ?? raw.type ?? 0)
+  const openPrice = Number(raw.OpenPrice ?? raw.openPrice ?? 0)
+  const profit = Number(raw.Profit ?? raw.profit ?? 0)
+  const openTime = String(raw.OpenTime ?? raw.openTime ?? '')
+  return { ticket, symbol, lots, type, openPrice, profit, openTime }
+}
+
+function mapServerHistoryRow(raw: Record<string, unknown>): MtServerHistoryRow | null {
+  const ticket = Number(raw.Ticket ?? raw.ticket)
+  if (!Number.isFinite(ticket)) return null
+  const symbol = String(raw.Symbol ?? raw.symbol ?? '').trim()
+  const lots = Number(raw.Lots ?? raw.lots ?? 0)
+  const type = Number(raw.Type ?? raw.type ?? 0)
+  const openPrice = Number(raw.OpenPrice ?? raw.openPrice ?? 0)
+  const closePrice = Number(raw.ClosePrice ?? raw.closePrice ?? 0)
+  const profit = Number(raw.Profit ?? raw.profit ?? 0)
+  const openTime = String(raw.OpenTime ?? raw.openTime ?? '')
+  const closeTime = String(raw.CloseTime ?? raw.closeTime ?? '')
+  return { ticket, symbol, lots, type, openPrice, closePrice, profit, openTime, closeTime }
+}
+
+function tradeResultLooksFailed(parsed: Record<string, unknown>): boolean {
+  if (parsed.error != null && parsed.error !== '') return true
+  if (parsed.success === false) return true
+  if (parsed.statusCode != null && Number(parsed.statusCode) >= 400) return true
+  return false
+}
+
+function extractTicketFromTradeResult(parsed: Record<string, unknown>): number | null {
+  const t = Number(parsed.Ticket ?? parsed.ticket ?? parsed.order ?? parsed.Order)
+  return Number.isFinite(t) && t > 0 ? t : null
+}
+
 type MtOhlcRow = {
   time: string
   open: number
@@ -404,6 +496,28 @@ export function PlatformPage() {
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const signalRConnRef = useRef<signalR.HubConnection | null>(null)
+  const requestAccountSnapshotRef = useRef<(() => Promise<void>) | null>(null)
+  const pendingOpenTradeRef = useRef<{
+    side: 'BUY' | 'SELL'
+    symbol: string
+    lotSize: number
+    entryPrice: number
+    tpPrice: number | null
+    slPrice: number | null
+    openedAtIso: string
+  } | null>(null)
+  const pendingTradeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  type ChartTradeRow = {
+    id: string
+    side: 'BUY' | 'SELL'
+    symbol: string
+    lotSize: number
+    entryPrice: number
+    tpPrice: number | null
+    slPrice: number | null
+    openedAtIso: string
+  }
+  const appendLocalChartTradeRef = useRef<((historyItem: ChartTradeRow) => void) | null>(null)
   const lastKlineBarRef = useRef<{ high: number; low: number; close: number } | null>(null)
   /** True after POST Manage/ohlc has populated the series (live ticks only extend/update after this). */
   const mtOhlcLoadedRef = useRef(false)
@@ -476,6 +590,12 @@ export function PlatformPage() {
     lotSize: number
     atIso: string
   } | null>(null)
+
+  const [serverOpenPositions, setServerOpenPositions] = useState<MtServerOpenPosition[]>([])
+  const [serverHistoryRows, setServerHistoryRows] = useState<MtServerHistoryRow[]>([])
+  const [historyCloseModal, setHistoryCloseModal] = useState<MtServerOpenPosition | null>(null)
+  const [historyCloseStep, setHistoryCloseStep] = useState<'choose' | 'partial'>('choose')
+  const [partialCloseLotsInput, setPartialCloseLotsInput] = useState('')
 
   const sampleCandles = useMemo(() => generateSampleCandles(), [])
 
@@ -576,6 +696,56 @@ export function PlatformPage() {
         lineStyle: 2,
       })
     }
+  }
+
+  const clearPendingTradeTimer = () => {
+    const t = pendingTradeTimerRef.current
+    if (t != null) window.clearTimeout(t)
+    pendingTradeTimerRef.current = null
+  }
+
+  appendLocalChartTradeRef.current = (historyItem: ChartTradeRow) => {
+    setTradeHistory((prev) => {
+      const next = [historyItem, ...prev]
+      tradeHistoryRef.current = next
+      return next
+    })
+
+    const series = seriesRef.current
+    if (series) {
+      const existing = priceLinesRef.current[historyItem.id]
+      if (existing?.entry) removeSeriesPriceLine(series, existing.entry)
+      if (existing?.tp) removeSeriesPriceLine(series, existing.tp)
+      if (existing?.sl) removeSeriesPriceLine(series, existing.sl)
+
+      const entryLine = series.createPriceLine({
+        price: historyItem.entryPrice,
+        title: `${historyItem.side} entry`,
+        color: historyItem.side === 'BUY' ? 'rgba(16,185,129,0.95)' : 'rgba(239,68,68,0.95)',
+        lineWidth: 2,
+        lineStyle: 0,
+        axisLabelVisible: true,
+      })
+      const tpLine = series.createPriceLine({
+        price: historyItem.tpPrice!,
+        title: 'TP (drag)',
+        color: 'rgba(16,185,129,0.6)',
+        lineWidth: 2,
+        lineStyle: 2,
+        axisLabelVisible: true,
+      })
+      const slLine = series.createPriceLine({
+        price: historyItem.slPrice!,
+        title: 'SL (drag)',
+        color: 'rgba(239,68,68,0.6)',
+        lineWidth: 2,
+        lineStyle: 2,
+        axisLabelVisible: true,
+      })
+
+      priceLinesRef.current[historyItem.id] = { entry: entryLine, tp: tpLine, sl: slLine }
+    }
+    syncTradeLineVisuals(selectedTradeIdRef.current)
   }
 
   useEffect(() => {
@@ -1057,8 +1227,104 @@ export function PlatformPage() {
         }),
       })
 
-    const onServer = (envelope: { name?: string; message?: string }) => {
-      if (!envelope || envelope.name !== 'quote') return
+    const subscribeAccount = () =>
+      hub.invoke('Server', {
+        name: 'subscribeToAccount',
+        message: JSON.stringify({
+          terminal: SIGNALR_TERMINAL,
+          account: SIGNALR_ACCOUNT,
+        }),
+      })
+
+    const requestSnapshot = () =>
+      hub.invoke('Server', {
+        name: 'requestAccountSnapshot',
+        message: JSON.stringify({
+          terminal: SIGNALR_TERMINAL,
+          account: SIGNALR_ACCOUNT,
+        }),
+      })
+
+    requestAccountSnapshotRef.current = requestSnapshot
+
+    const onServer = (envelope: {
+      name?: string
+      message?: string
+      Name?: string
+      Message?: string
+    }) => {
+      if (!envelope || cancelled) return
+      const { name: rawName, message: msg } = envName(envelope)
+      const name = rawName.toLowerCase()
+
+      if (name === 'accountsnapshoterror') {
+        setTradeError(msg || 'Account snapshot error')
+        return
+      }
+
+      if (name === 'accountinfo') {
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(msg || '{}')
+        } catch {
+          return
+        }
+        const slice = getHistorySlice(parsed)
+        if (!slice) return
+        const opens = slice.userOpenOrders
+          .map(mapServerOpen)
+          .filter((x): x is MtServerOpenPosition => x != null && x.symbol.length > 0)
+        const closed = slice.userHistory
+          .map(mapServerHistoryRow)
+          .filter((x): x is MtServerHistoryRow => x != null && x.symbol.length > 0)
+        setServerOpenPositions(opens)
+        setServerHistoryRows(closed)
+        return
+      }
+
+      if (name === 'tradeexecuteresult') {
+        let parsed: Record<string, unknown>
+        try {
+          parsed = JSON.parse(msg || '{}') as Record<string, unknown>
+        } catch {
+          return
+        }
+        clearPendingTradeTimer()
+        const failed = tradeResultLooksFailed(parsed)
+        const pend = pendingOpenTradeRef.current
+        if (failed) {
+          pendingOpenTradeRef.current = null
+          const errMsg =
+            (typeof parsed.message === 'string' && parsed.message) ||
+            (typeof parsed.error === 'string' && parsed.error) ||
+            'Trade rejected'
+          setTradeError(errMsg)
+          void requestSnapshot().catch(() => {})
+          return
+        }
+        if (pend) {
+          pendingOpenTradeRef.current = null
+          setTradeError(null)
+          const ticket = extractTicketFromTradeResult(parsed)
+          const id = ticket != null ? `mt-${ticket}` : createTradeId()
+          const row: ChartTradeRow = {
+            id,
+            side: pend.side,
+            symbol: pend.symbol,
+            lotSize: pend.lotSize,
+            entryPrice: pend.entryPrice,
+            tpPrice: pend.tpPrice,
+            slPrice: pend.slPrice,
+            openedAtIso: pend.openedAtIso,
+          }
+          appendLocalChartTradeRef.current?.(row)
+        }
+        void requestSnapshot().catch(() => {})
+        return
+      }
+
+      if (name !== 'quote') return
+
       let data: {
         terminal?: string
         account?: number
@@ -1068,7 +1334,7 @@ export function PlatformPage() {
         timeIso?: string
       }
       try {
-        data = JSON.parse(envelope.message ?? '{}')
+        data = JSON.parse(msg || '{}')
       } catch {
         return
       }
@@ -1138,7 +1404,11 @@ export function PlatformPage() {
 
     hub.on('Server', onServer)
     hub.onreconnected(() => {
-      void subscribeQuotes().catch(() => {})
+      void (async () => {
+        await subscribeQuotes().catch(() => {})
+        await subscribeAccount().catch(() => {})
+        await requestSnapshot().catch(() => {})
+      })()
     })
 
     void (async () => {
@@ -1150,6 +1420,8 @@ export function PlatformPage() {
         }
         signalRConnRef.current = hub
         await subscribeQuotes()
+        await subscribeAccount()
+        await requestSnapshot()
       } catch (e) {
         if (!cancelled) {
           const msg = e instanceof Error ? e.message : 'SignalR connection failed'
@@ -1160,7 +1432,10 @@ export function PlatformPage() {
 
     return () => {
       cancelled = true
+      clearPendingTradeTimer()
+      pendingOpenTradeRef.current = null
       signalRConnRef.current = null
+      requestAccountSnapshotRef.current = null
       tickBarRef.current = null
       setLiveQuote(null)
       hub.off('Server', onServer)
@@ -1169,6 +1444,11 @@ export function PlatformPage() {
       if (s) s.setData([])
     }
   }, [symbol, chartTfMinutes])
+
+  useEffect(() => {
+    if (platformTab !== 'history' || !USE_SIGNALR_STREAM) return
+    void requestAccountSnapshotRef.current?.().catch(() => {})
+  }, [platformTab])
 
   /** Log when bid/ask hits TP or SL; trades stay open (no removal). */
   useEffect(() => {
@@ -1229,8 +1509,54 @@ export function PlatformPage() {
     const entryPrice = latestPrice
     const tpPrice = defaultTpPrice(side, entryPrice)
     const slPrice = defaultSlPrice(side, entryPrice)
+    const sym = symbol.trim().toUpperCase()
 
-    const historyItem = {
+    if (USE_SIGNALR_STREAM) {
+      const hub = signalRConnRef.current
+      if (!hub || hub.state !== signalR.HubConnectionState.Connected) {
+        setTradeError('Not connected to the trade server.')
+        return
+      }
+
+      pendingOpenTradeRef.current = {
+        side,
+        symbol: sym,
+        lotSize: parsed,
+        entryPrice,
+        tpPrice,
+        slPrice,
+        openedAtIso: trade.atIso,
+      }
+      clearPendingTradeTimer()
+      pendingTradeTimerRef.current = window.setTimeout(() => {
+        pendingTradeTimerRef.current = null
+        if (pendingOpenTradeRef.current) {
+          pendingOpenTradeRef.current = null
+          setTradeError('Trade was not confirmed by the server in time.')
+        }
+      }, 30_000)
+
+      const body = {
+        terminalType: SIGNALR_TERMINAL,
+        accountNumber: SIGNALR_ACCOUNT,
+        symbol: sym,
+        lots: parsed,
+        type: side === 'BUY' ? 0 : 1,
+        actionMode: 'addPosition',
+        partialCloseTickets: [] as number[],
+      }
+
+      void hub
+        .invoke('Server', { name: 'executeTrade', message: JSON.stringify(body) })
+        .catch((e) => {
+          clearPendingTradeTimer()
+          pendingOpenTradeRef.current = null
+          setTradeError(e instanceof Error ? e.message : 'executeTrade failed')
+        })
+      return
+    }
+
+    const historyItem: ChartTradeRow = {
       id: createTradeId(),
       side,
       symbol,
@@ -1240,49 +1566,50 @@ export function PlatformPage() {
       slPrice,
       openedAtIso: trade.atIso,
     }
-    setTradeHistory((prev) => {
-      const next = [historyItem, ...prev]
-      tradeHistoryRef.current = next
-      return next
-    })
-
-    const series = seriesRef.current
-    if (series) {
-      const existing = priceLinesRef.current[historyItem.id]
-      if (existing?.entry) removeSeriesPriceLine(series, existing.entry)
-      if (existing?.tp) removeSeriesPriceLine(series, existing.tp)
-      if (existing?.sl) removeSeriesPriceLine(series, existing.sl)
-
-      const entryLine = series.createPriceLine({
-        price: entryPrice,
-        title: `${side} entry`,
-        color: side === 'BUY' ? 'rgba(16,185,129,0.95)' : 'rgba(239,68,68,0.95)',
-        lineWidth: 2,
-        lineStyle: 0,
-        axisLabelVisible: true,
-      })
-      const tpLine = series.createPriceLine({
-        price: tpPrice,
-        title: 'TP (drag)',
-        color: 'rgba(16,185,129,0.6)',
-        lineWidth: 2,
-        lineStyle: 2,
-        axisLabelVisible: true,
-      })
-      const slLine = series.createPriceLine({
-        price: slPrice,
-        title: 'SL (drag)',
-        color: 'rgba(239,68,68,0.6)',
-        lineWidth: 2,
-        lineStyle: 2,
-        axisLabelVisible: true,
-      })
-
-      priceLinesRef.current[historyItem.id] = { entry: entryLine, tp: tpLine, sl: slLine }
-    }
-    syncTradeLineVisuals(selectedTradeId)
-    // placeholder until a real trading API is wired
+    appendLocalChartTradeRef.current?.(historyItem)
     console.log('OPEN_TRADE', trade)
+  }
+
+  const submitServerPositionClose = (mode: 'full' | 'partial') => {
+    const pos = historyCloseModal
+    const hub = signalRConnRef.current
+    if (!pos || !hub || hub.state !== signalR.HubConnectionState.Connected) {
+      setTradeError('Not connected to the trade server.')
+      return
+    }
+    const lots =
+      mode === 'full' ? pos.lots : Number(String(partialCloseLotsInput).replace(',', '.'))
+    if (mode === 'partial') {
+      if (!Number.isFinite(lots) || lots <= 0) {
+        setTradeError('Enter a valid lot size to close.')
+        return
+      }
+      if (lots >= pos.lots) {
+        setTradeError('Partial close must be less than the open volume (use fully close for the rest).')
+        return
+      }
+    } else if (!Number.isFinite(lots) || lots <= 0) {
+      setTradeError('Invalid open volume.')
+      return
+    }
+
+    setTradeError(null)
+    const body = {
+      terminalType: SIGNALR_TERMINAL,
+      accountNumber: SIGNALR_ACCOUNT,
+      symbol: pos.symbol,
+      lots,
+      type: pos.type,
+      actionMode: 'partialClose',
+      partialCloseTickets: [pos.ticket],
+    }
+    void hub
+      .invoke('Server', { name: 'executeTrade', message: JSON.stringify(body) })
+      .then(() => void requestAccountSnapshotRef.current?.().catch(() => {}))
+      .catch((e) => setTradeError(e instanceof Error ? e.message : 'Close failed'))
+    setHistoryCloseModal(null)
+    setHistoryCloseStep('choose')
+    setPartialCloseLotsInput('')
   }
 
   const removeTradeTp = (tradeId: string) => {
@@ -2042,79 +2369,251 @@ export function PlatformPage() {
             </div>
           </div>
 
-          <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 8, color: '#e5e5e5' }}>
-          <thead>
-            <tr style={{ textAlign: 'left', fontSize: 12, color: '#a3a3a3' }}>
-              <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Time</th>
-              <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Symbol</th>
-              <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Side</th>
-              <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Lot</th>
-              <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>
-                Entry
-              </th>
-              {/* <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>
-                Current
-              </th> */}
-              <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>TP / SL</th>
-              <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>PnL</th>
-            </tr>
-          </thead>
-          <tbody>
-            {tradeHistory.length === 0 ? (
-              <tr>
-                <td style={{ padding: 10, color: '#a3a3a3' }} colSpan={8}>
-                  No trades yet.
-                </td>
-              </tr>
-            ) : (
-              tradeHistory.map((t) => {
-                const current = latestPrice ?? t.entryPrice
-                const pnl =
-                  (t.side === 'BUY' ? current - t.entryPrice : t.entryPrice - current) *
-                  t.lotSize
-                const pnlColor = pnl >= 0 ? '#42a5f5' : '#ef5350'
-                const tpHit =
-                  t.tpPrice != null &&
-                  (t.side === 'BUY' ? current >= t.tpPrice : current <= t.tpPrice)
-                const slHit =
-                  t.slPrice != null &&
-                  (t.side === 'BUY' ? current <= t.slPrice : current >= t.slPrice)
-                return (
-                  <tr key={t.id} style={{ borderBottom: '1px solid #2a2a2a' }}>
-                    <td style={{ padding: '8px 6px', fontSize: 12, color: '#a3a3a3' }}>
-                      {new Date(t.openedAtIso).toLocaleString()}
-                    </td>
-                    <td style={{ padding: '8px 6px' }}>{t.symbol}</td>
-                    <td style={{ padding: '8px 6px' }}>{t.side}</td>
-                    <td style={{ padding: '8px 6px' }}>{t.lotSize}</td>
-                    <td style={{ padding: '8px 6px' }}>{t.entryPrice.toFixed(2)}</td>
-                    {/* <td style={{ padding: '8px 6px' }}>{current.toFixed(2)}</td> */}
-                    <td style={{ padding: '8px 6px', fontSize: 12, color: '#a3a3a3' }}>
-                      {t.tpPrice != null ? (
-                        <>
-                          TP {t.tpPrice.toFixed(2)} {tpHit ? '(hit)' : ''}
-                        </>
-                      ) : (
-                        <>TP —</>
-                      )}
-                      <br />
-                      {t.slPrice != null ? (
-                        <>
-                          SL {t.slPrice.toFixed(2)} {slHit ? '(hit)' : ''}
-                        </>
-                      ) : (
-                        <>SL —</>
-                      )}
-                    </td>
-                    <td style={{ padding: '8px 6px', color: pnlColor, fontWeight: 600 }}>
-                      {pnl.toFixed(2)}
+          {USE_SIGNALR_STREAM ? (
+            <>
+              <div style={{ marginTop: 14, fontWeight: 600, color: '#fafafa', fontSize: 13 }}>
+                Open positions (tap to close)
+              </div>
+              <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 8, color: '#e5e5e5' }}>
+                <thead>
+                  <tr style={{ textAlign: 'left', fontSize: 12, color: '#a3a3a3' }}>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Ticket</th>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Symbol</th>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Side</th>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Lots</th>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Open</th>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>P/L</th>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Opened</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {serverOpenPositions.length === 0 ? (
+                    <tr>
+                      <td style={{ padding: 10, color: '#a3a3a3' }} colSpan={7}>
+                        No open positions.
+                      </td>
+                    </tr>
+                  ) : (
+                    serverOpenPositions.map((o) => (
+                      <tr
+                        key={o.ticket}
+                        onClick={() => {
+                          setHistoryCloseStep('choose')
+                          setPartialCloseLotsInput('')
+                          setHistoryCloseModal(o)
+                        }}
+                        style={{
+                          borderBottom: '1px solid #2a2a2a',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        <td style={{ padding: '8px 6px', fontSize: 12 }}>{o.ticket}</td>
+                        <td style={{ padding: '8px 6px' }}>{o.symbol}</td>
+                        <td style={{ padding: '8px 6px' }}>{o.type === 0 ? 'BUY' : 'SELL'}</td>
+                        <td style={{ padding: '8px 6px' }}>{o.lots}</td>
+                        <td style={{ padding: '8px 6px' }}>{o.openPrice.toFixed(2)}</td>
+                        <td
+                          style={{
+                            padding: '8px 6px',
+                            color: o.profit >= 0 ? '#42a5f5' : '#ef5350',
+                            fontWeight: 600,
+                          }}
+                        >
+                          {o.profit.toFixed(2)}
+                        </td>
+                        <td style={{ padding: '8px 6px', fontSize: 12, color: '#a3a3a3' }}>
+                          {o.openTime ? new Date(o.openTime).toLocaleString() : '—'}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+
+              <div style={{ marginTop: 18, fontWeight: 600, color: '#fafafa', fontSize: 13 }}>
+                Closed (account history)
+              </div>
+              <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 8, color: '#e5e5e5' }}>
+                <thead>
+                  <tr style={{ textAlign: 'left', fontSize: 12, color: '#a3a3a3' }}>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Ticket</th>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Symbol</th>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Side</th>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Lots</th>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Open</th>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Close</th>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>P/L</th>
+                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Closed</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {serverHistoryRows.length === 0 ? (
+                    <tr>
+                      <td style={{ padding: 10, color: '#a3a3a3' }} colSpan={8}>
+                        No closed trades in snapshot.
+                      </td>
+                    </tr>
+                  ) : (
+                    serverHistoryRows.map((r) => (
+                      <tr key={`${r.ticket}-${r.closeTime}`} style={{ borderBottom: '1px solid #2a2a2a' }}>
+                        <td style={{ padding: '8px 6px', fontSize: 12 }}>{r.ticket}</td>
+                        <td style={{ padding: '8px 6px' }}>{r.symbol}</td>
+                        <td style={{ padding: '8px 6px' }}>{r.type === 0 ? 'BUY' : 'SELL'}</td>
+                        <td style={{ padding: '8px 6px' }}>{r.lots}</td>
+                        <td style={{ padding: '8px 6px' }}>{r.openPrice.toFixed(2)}</td>
+                        <td style={{ padding: '8px 6px' }}>{r.closePrice.toFixed(2)}</td>
+                        <td
+                          style={{
+                            padding: '8px 6px',
+                            color: r.profit >= 0 ? '#42a5f5' : '#ef5350',
+                            fontWeight: 600,
+                          }}
+                        >
+                          {r.profit.toFixed(2)}
+                        </td>
+                        <td style={{ padding: '8px 6px', fontSize: 12, color: '#a3a3a3' }}>
+                          {r.closeTime ? new Date(r.closeTime).toLocaleString() : '—'}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+
+              {tradeHistory.length > 0 ? (
+                <>
+                  <div style={{ marginTop: 18, fontWeight: 600, color: '#fafafa', fontSize: 13 }}>
+                    Chart trades (TP / SL lines)
+                  </div>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 8, color: '#e5e5e5' }}>
+                    <thead>
+                      <tr style={{ textAlign: 'left', fontSize: 12, color: '#a3a3a3' }}>
+                        <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Time</th>
+                        <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Symbol</th>
+                        <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Side</th>
+                        <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Lot</th>
+                        <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Entry</th>
+                        <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>TP / SL</th>
+                        <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>PnL</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {tradeHistory.map((t) => {
+                        const current = latestPrice ?? t.entryPrice
+                        const pnl =
+                          (t.side === 'BUY' ? current - t.entryPrice : t.entryPrice - current) * t.lotSize
+                        const pnlColor = pnl >= 0 ? '#42a5f5' : '#ef5350'
+                        const tpHit =
+                          t.tpPrice != null &&
+                          (t.side === 'BUY' ? current >= t.tpPrice : current <= t.tpPrice)
+                        const slHit =
+                          t.slPrice != null &&
+                          (t.side === 'BUY' ? current <= t.slPrice : current >= t.slPrice)
+                        return (
+                          <tr key={t.id} style={{ borderBottom: '1px solid #2a2a2a' }}>
+                            <td style={{ padding: '8px 6px', fontSize: 12, color: '#a3a3a3' }}>
+                              {new Date(t.openedAtIso).toLocaleString()}
+                            </td>
+                            <td style={{ padding: '8px 6px' }}>{t.symbol}</td>
+                            <td style={{ padding: '8px 6px' }}>{t.side}</td>
+                            <td style={{ padding: '8px 6px' }}>{t.lotSize}</td>
+                            <td style={{ padding: '8px 6px' }}>{t.entryPrice.toFixed(2)}</td>
+                            <td style={{ padding: '8px 6px', fontSize: 12, color: '#a3a3a3' }}>
+                              {t.tpPrice != null ? (
+                                <>
+                                  TP {t.tpPrice.toFixed(2)} {tpHit ? '(hit)' : ''}
+                                </>
+                              ) : (
+                                <>TP —</>
+                              )}
+                              <br />
+                              {t.slPrice != null ? (
+                                <>
+                                  SL {t.slPrice.toFixed(2)} {slHit ? '(hit)' : ''}
+                                </>
+                              ) : (
+                                <>SL —</>
+                              )}
+                            </td>
+                            <td style={{ padding: '8px 6px', color: pnlColor, fontWeight: 600 }}>
+                              {pnl.toFixed(2)}
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </>
+              ) : null}
+            </>
+          ) : (
+            <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 8, color: '#e5e5e5' }}>
+              <thead>
+                <tr style={{ textAlign: 'left', fontSize: 12, color: '#a3a3a3' }}>
+                  <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Time</th>
+                  <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Symbol</th>
+                  <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Side</th>
+                  <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Lot</th>
+                  <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Entry</th>
+                  <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>TP / SL</th>
+                  <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>PnL</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tradeHistory.length === 0 ? (
+                  <tr>
+                    <td style={{ padding: 10, color: '#a3a3a3' }} colSpan={7}>
+                      No trades yet.
                     </td>
                   </tr>
-                )
-              })
-            )}
-          </tbody>
-          </table>
+                ) : (
+                  tradeHistory.map((t) => {
+                    const current = latestPrice ?? t.entryPrice
+                    const pnl =
+                      (t.side === 'BUY' ? current - t.entryPrice : t.entryPrice - current) * t.lotSize
+                    const pnlColor = pnl >= 0 ? '#42a5f5' : '#ef5350'
+                    const tpHit =
+                      t.tpPrice != null &&
+                      (t.side === 'BUY' ? current >= t.tpPrice : current <= t.tpPrice)
+                    const slHit =
+                      t.slPrice != null &&
+                      (t.side === 'BUY' ? current <= t.slPrice : current >= t.slPrice)
+                    return (
+                      <tr key={t.id} style={{ borderBottom: '1px solid #2a2a2a' }}>
+                        <td style={{ padding: '8px 6px', fontSize: 12, color: '#a3a3a3' }}>
+                          {new Date(t.openedAtIso).toLocaleString()}
+                        </td>
+                        <td style={{ padding: '8px 6px' }}>{t.symbol}</td>
+                        <td style={{ padding: '8px 6px' }}>{t.side}</td>
+                        <td style={{ padding: '8px 6px' }}>{t.lotSize}</td>
+                        <td style={{ padding: '8px 6px' }}>{t.entryPrice.toFixed(2)}</td>
+                        <td style={{ padding: '8px 6px', fontSize: 12, color: '#a3a3a3' }}>
+                          {t.tpPrice != null ? (
+                            <>
+                              TP {t.tpPrice.toFixed(2)} {tpHit ? '(hit)' : ''}
+                            </>
+                          ) : (
+                            <>TP —</>
+                          )}
+                          <br />
+                          {t.slPrice != null ? (
+                            <>
+                              SL {t.slPrice.toFixed(2)} {slHit ? '(hit)' : ''}
+                            </>
+                          ) : (
+                            <>SL —</>
+                          )}
+                        </td>
+                        <td style={{ padding: '8px 6px', color: pnlColor, fontWeight: 600 }}>
+                          {pnl.toFixed(2)}
+                        </td>
+                      </tr>
+                    )
+                  })
+                )}
+              </tbody>
+            </table>
+          )}
         </div>
       </div>
 
@@ -2175,6 +2674,153 @@ export function PlatformPage() {
           History
         </button>
       </div>
+
+      {historyCloseModal ? (
+        <div
+          role="presentation"
+          onClick={() => {
+            setHistoryCloseModal(null)
+            setHistoryCloseStep('choose')
+            setPartialCloseLotsInput('')
+          }}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 4000,
+            background: 'rgba(0,0,0,0.6)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 16,
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 'min(360px, 100%)',
+              borderRadius: 12,
+              background: '#1a1a1a',
+              border: '1px solid #333',
+              padding: 16,
+              color: '#e5e5e5',
+            }}
+          >
+            <div style={{ fontWeight: 700, marginBottom: 8 }}>
+              Close position #{historyCloseModal.ticket}
+            </div>
+            <div style={{ fontSize: 13, color: '#a3a3a3', marginBottom: 14 }}>
+              {historyCloseModal.symbol} · {historyCloseModal.type === 0 ? 'BUY' : 'SELL'} · open{' '}
+              {historyCloseModal.lots} lot
+              {historyCloseModal.lots === 1 ? '' : 's'} @ {historyCloseModal.openPrice.toFixed(2)}
+            </div>
+            {historyCloseStep === 'choose' ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <button
+                  type="button"
+                  onClick={() => submitServerPositionClose('full')}
+                  style={{
+                    padding: '10px 12px',
+                    borderRadius: 8,
+                    border: '1px solid #1565c0',
+                    background: '#1565c0',
+                    color: '#fff',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                  }}
+                >
+                  Fully close ticket
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setHistoryCloseStep('partial')}
+                  style={{
+                    padding: '10px 12px',
+                    borderRadius: 8,
+                    border: '1px solid #404040',
+                    background: '#262626',
+                    color: '#e5e5e5',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                  }}
+                >
+                  Close partially…
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setHistoryCloseModal(null)
+                    setHistoryCloseStep('choose')
+                    setPartialCloseLotsInput('')
+                  }}
+                  style={{
+                    padding: '8px 12px',
+                    borderRadius: 8,
+                    border: 'none',
+                    background: 'transparent',
+                    color: '#a3a3a3',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <label style={{ fontSize: 12, color: '#a3a3a3' }}>
+                  Lots to close (max {historyCloseModal.lots})
+                  <input
+                    value={partialCloseLotsInput}
+                    onChange={(e) => setPartialCloseLotsInput(e.target.value)}
+                    inputMode="decimal"
+                    style={{
+                      display: 'block',
+                      width: '100%',
+                      marginTop: 6,
+                      padding: '8px 10px',
+                      borderRadius: 8,
+                      border: '1px solid #404040',
+                      background: '#0d0d0d',
+                      color: '#fafafa',
+                      fontSize: 14,
+                    }}
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={() => submitServerPositionClose('partial')}
+                  style={{
+                    padding: '10px 12px',
+                    borderRadius: 8,
+                    border: '1px solid #1565c0',
+                    background: '#1565c0',
+                    color: '#fff',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                  }}
+                >
+                  Confirm partial close
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setHistoryCloseStep('choose')}
+                  style={{
+                    padding: '8px 12px',
+                    borderRadius: 8,
+                    border: 'none',
+                    background: 'transparent',
+                    color: '#a3a3a3',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Back
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : null}
 
       {error ? (
         <div
