@@ -1,8 +1,41 @@
 import * as signalR from '@microsoft/signalr'
 import { useDrag } from '@use-gesture/react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { CandlestickSeries, createChart, CrosshairMode } from 'lightweight-charts'
-import type { IChartApi, IPriceLine, ISeriesApi, UTCTimestamp } from 'lightweight-charts'
+import {
+  CandlestickSeries,
+  createChart,
+  createSeriesMarkers,
+  CrosshairMode,
+  LineSeries,
+  LineStyle,
+} from 'lightweight-charts'
+import type {
+  IChartApi,
+  IPriceLine,
+  ISeriesApi,
+  ISeriesMarkersPluginApi,
+  SeriesMarker,
+  Time,
+  UTCTimestamp,
+} from 'lightweight-charts'
+
+/** `public/metatrader.mp3` — play on open / close / TP-SL / partial (after server success where applicable). */
+const META_TRADER_SOUND_URL = '/metatrader.mp3'
+let metaTraderSoundAudio: HTMLAudioElement | null = null
+
+function playMetaTraderTradeSound() {
+  if (typeof window === 'undefined') return
+  try {
+    if (!metaTraderSoundAudio) {
+      metaTraderSoundAudio = new Audio(META_TRADER_SOUND_URL)
+      metaTraderSoundAudio.preload = 'auto'
+    }
+    metaTraderSoundAudio.currentTime = 0
+    void metaTraderSoundAudio.play().catch(() => {})
+  } catch {
+    /* ignore missing decode / autoplay blocks */
+  }
+}
 
 function removeSeriesPriceLine(series: ISeriesApi<'Candlestick'>, line: IPriceLine | undefined | null) {
   if (line == null) return
@@ -343,6 +376,19 @@ function mapServerHistoryRow(raw: Record<string, unknown>): MtServerHistoryRow |
   return { ticket, symbol, lots, type, openPrice, closePrice, profit, openTime, closeTime }
 }
 
+/** Closed-trade chart: buy side blue, sell side orange (connector matches open side). */
+const CHART_HISTORY_BUY_COLOR = '#2563eb'
+const CHART_HISTORY_SELL_COLOR = '#ea580c'
+
+function mtHistoryTimeToUtcTimestamp(raw: string): UTCTimestamp | null {
+  const t = raw.trim()
+  if (!t) return null
+  const isoish = t.includes('T') ? t : `${t.replace(' ', 'T')}Z`
+  const ms = Date.parse(isoish)
+  if (Number.isNaN(ms)) return null
+  return Math.floor(ms / 1000) as UTCTimestamp
+}
+
 function tradeResultLooksFailed(parsed: Record<string, unknown>): boolean {
   if (parsed.error != null && parsed.error !== '') return true
   if (parsed.success === false) return true
@@ -539,6 +585,9 @@ export function PlatformPage() {
   const pointerTapStartRef = useRef<{ x: number; y: number; t: number; id: number } | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
+  const historyMarkersApiRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null)
+  const historyConnectorLinesRef = useRef<ISeriesApi<'Line'>[]>([])
+  const [chartReady, setChartReady] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
   const signalRConnRef = useRef<signalR.HubConnection | null>(null)
   const requestAccountSnapshotRef = useRef<(() => Promise<void>) | null>(null)
@@ -1036,8 +1085,15 @@ export function PlatformPage() {
         })
 
         const series = chart.addSeries(CandlestickSeries)
+        const historyMarkers = createSeriesMarkers(series, [], {
+          autoScale: true,
+          zOrder: 'aboveSeries',
+        })
+        historyMarkersApiRef.current = historyMarkers
+
         chartRef.current = chart
         seriesRef.current = series
+        setChartReady(true)
         if (USE_SIGNALR_STREAM) {
           void requestAccountSnapshotRef.current?.().catch(() => {})
         }
@@ -1053,6 +1109,17 @@ export function PlatformPage() {
         window.addEventListener('resize', onResize)
         return () => {
           window.removeEventListener('resize', onResize)
+          setChartReady(false)
+          for (const ls of historyConnectorLinesRef.current) {
+            try {
+              chart.removeSeries(ls)
+            } catch {
+              /* series may already be detached */
+            }
+          }
+          historyConnectorLinesRef.current = []
+          historyMarkersApiRef.current?.detach()
+          historyMarkersApiRef.current = null
           chart.remove()
           chartRef.current = null
           seriesRef.current = null
@@ -1072,6 +1139,124 @@ export function PlatformPage() {
       cleanup?.()
     }
   }, [])
+
+  const MAX_CHART_HISTORY_TRADES = 120
+
+  useEffect(() => {
+    const chart = chartRef.current
+    const markersApi = historyMarkersApiRef.current
+    if (!chartReady || !chart || !markersApi) return
+
+    const clearConnectors = () => {
+      for (const ls of historyConnectorLinesRef.current) {
+        try {
+          chart.removeSeries(ls)
+        } catch {
+          /* noop */
+        }
+      }
+      historyConnectorLinesRef.current = []
+    }
+
+    if (!USE_SIGNALR_STREAM || platformTab !== 'chart') {
+      markersApi.setMarkers([])
+      clearConnectors()
+      return
+    }
+
+    const sym = symbol.trim().toUpperCase()
+    const openForSym = serverOpenPositions.filter(
+      (o) =>
+        o.symbol.trim().toUpperCase() === sym &&
+        Number.isFinite(o.openPrice) &&
+        o.openPrice > 0,
+    )
+
+    clearConnectors()
+
+    const markers: SeriesMarker<Time>[] = []
+
+    if (openForSym.length > 0) {
+      for (const o of openForSym) {
+        const isBuy = o.type === 0
+        const sideColor = isBuy ? CHART_HISTORY_BUY_COLOR : CHART_HISTORY_SELL_COLOR
+        const tOpen = mtHistoryTimeToUtcTimestamp(o.openTime)
+        if (tOpen == null) continue
+        markers.push({
+          time: tOpen,
+          position: 'atPriceMiddle',
+          shape: isBuy ? 'arrowUp' : 'arrowDown',
+          color: sideColor,
+          price: o.openPrice,
+          id: `open-${o.ticket}`,
+          size: 1.35,
+        })
+      }
+    } else {
+      const rows = serverHistoryRows.filter(
+        (r) =>
+          r.symbol.trim().toUpperCase() === sym &&
+          Number.isFinite(r.openPrice) &&
+          Number.isFinite(r.closePrice) &&
+          r.openPrice > 0 &&
+          r.closePrice > 0,
+      )
+
+      const slice = rows.slice(0, MAX_CHART_HISTORY_TRADES)
+
+      for (const r of slice) {
+        const isBuy = r.type === 0
+        const sideColor = isBuy ? CHART_HISTORY_BUY_COLOR : CHART_HISTORY_SELL_COLOR
+        const oppColor = isBuy ? CHART_HISTORY_SELL_COLOR : CHART_HISTORY_BUY_COLOR
+        const tOpen = mtHistoryTimeToUtcTimestamp(r.openTime)
+        const tCloseRaw = mtHistoryTimeToUtcTimestamp(r.closeTime)
+        if (tOpen == null || tCloseRaw == null) continue
+        let tClose = tCloseRaw
+        if (tClose <= tOpen) tClose = ((tOpen as number) + 1) as UTCTimestamp
+
+        markers.push({
+          time: tOpen,
+          position: 'atPriceMiddle',
+          shape: isBuy ? 'arrowUp' : 'arrowDown',
+          color: sideColor,
+          price: r.openPrice,
+          id: `hist-${r.ticket}-open`,
+          size: 1.35,
+        })
+        markers.push({
+          time: tClose,
+          position: 'atPriceMiddle',
+          shape: isBuy ? 'arrowDown' : 'arrowUp',
+          color: oppColor,
+          price: r.closePrice,
+          id: `hist-${r.ticket}-close`,
+          size: 1.35,
+        })
+
+        const conn = chart.addSeries(LineSeries, {
+          color: sideColor,
+          lineWidth: 2,
+          lineStyle: LineStyle.Dashed,
+          lineVisible: true,
+          lastValueVisible: false,
+          priceLineVisible: false,
+        })
+        conn.setData([
+          { time: tOpen, value: r.openPrice },
+          { time: tClose, value: r.closePrice },
+        ])
+        historyConnectorLinesRef.current.push(conn)
+      }
+    }
+
+    markers.sort((a, b) => {
+      const ta = typeof a.time === 'number' ? a.time : 0
+      const tb = typeof b.time === 'number' ? b.time : 0
+      if (ta !== tb) return ta - tb
+      return String(a.id ?? '').localeCompare(String(b.id ?? ''))
+    })
+    markersApi.setMarkers(markers)
+  }, [serverHistoryRows, serverOpenPositions, symbol, platformTab, chartReady])
 
   useEffect(() => {
     if (!USE_SIGNALR_STREAM) {
@@ -1511,6 +1696,7 @@ export function PlatformPage() {
           void requestSnapshot().catch(() => {})
           return
         }
+        playMetaTraderTradeSound()
         if (pend) {
           pendingOpenTradeRef.current = null
           setTradeError(null)
@@ -1789,6 +1975,7 @@ export function PlatformPage() {
       openedAtIso: trade.atIso,
     }
     appendLocalChartTradeRef.current?.(historyItem)
+    playMetaTraderTradeSound()
     console.log('OPEN_TRADE', trade)
   }
 
@@ -1820,6 +2007,9 @@ export function PlatformPage() {
           stopLoss,
           takeProfit,
         }),
+      })
+      .then(() => {
+        playMetaTraderTradeSound()
       })
       .catch((e) => {
         pendingMtSlTpByTicketRef.current.delete(ticket)
