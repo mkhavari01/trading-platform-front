@@ -201,6 +201,56 @@ function normalizeChartTfMinutes(m: number): (typeof CHART_TF_OPTIONS)[number]['
   return hit ? hit.minutes : 1
 }
 
+const LS_CHART_UI_THEME = 'platformChartUiTheme'
+const LS_CHART_HISTORY_OVERLAY = 'platformChartHistoryOverlay'
+
+type ChartUiTheme = 'dark' | 'light'
+
+function readStoredChartUiTheme(): ChartUiTheme {
+  try {
+    const v = globalThis.localStorage?.getItem(LS_CHART_UI_THEME)
+    if (v === 'light' || v === 'dark') return v
+  } catch {
+    /* private mode */
+  }
+  return 'dark'
+}
+
+function readStoredHistoryOnChart(): boolean {
+  try {
+    const v = globalThis.localStorage?.getItem(LS_CHART_HISTORY_OVERLAY)
+    if (v === '0') return false
+    if (v === '1') return true
+  } catch {
+    /* private mode */
+  }
+  return true
+}
+
+/** Canvas + scales only (used by `createChart` / `applyOptions`). */
+function chartCanvasThemeOptions(theme: ChartUiTheme) {
+  if (theme === 'light') {
+    return {
+      layout: { background: { color: '#ffffff' }, textColor: '#111827' },
+      grid: {
+        vertLines: { color: '#e5e7eb' },
+        horzLines: { color: '#e5e7eb' },
+      },
+      rightPriceScale: { borderColor: '#e5e7eb' },
+      timeScale: { borderColor: '#e5e7eb' },
+    }
+  }
+  return {
+    layout: { background: { color: '#1a1a1a' }, textColor: '#d4d4d4' },
+    grid: {
+      vertLines: { color: '#2e2e2e' },
+      horzLines: { color: '#2e2e2e' },
+    },
+    rightPriceScale: { borderColor: '#3f3f3f' },
+    timeScale: { borderColor: '#3f3f3f' },
+  }
+}
+
 function minutesToBinanceKlineInterval(minutes: number): string {
   const map: Record<number, string> = {
     1: '1m',
@@ -667,6 +717,9 @@ export function PlatformPage() {
   const [selectedTradeId, setSelectedTradeId] = useState<string | null>(null)
   const [hideTpSlDragHint, setHideTpSlDragHint] = useState(readHideTpSlDragHint)
   const [platformTab, setPlatformTab] = useState<'chart' | 'history'>('chart')
+  const [chartUiTheme, setChartUiTheme] = useState<ChartUiTheme>(() => readStoredChartUiTheme())
+  /** Closed-trade markers + connectors, and open-position markers on the candlestick chart. */
+  const [showHistoryOnChart, setShowHistoryOnChart] = useState(() => readStoredHistoryOnChart())
   const [tradeHistory, setTradeHistory] = useState<
     Array<{
       id: string
@@ -1081,13 +1134,7 @@ export function PlatformPage() {
         const chart = createChart(containerRef.current, {
           width: containerRef.current.clientWidth,
           height: containerRef.current.clientHeight,
-          layout: { background: { color: '#ffffff' }, textColor: '#111827' },
-          grid: {
-            vertLines: { color: '#e5e7eb' },
-            horzLines: { color: '#e5e7eb' },
-          },
-          rightPriceScale: { borderColor: '#e5e7eb' },
-          timeScale: { borderColor: '#e5e7eb' },
+          ...chartCanvasThemeOptions(readStoredChartUiTheme()),
           crosshair: { mode: CrosshairMode.Normal },
         })
 
@@ -1147,6 +1194,27 @@ export function PlatformPage() {
     }
   }, [])
 
+  useEffect(() => {
+    if (!chartReady || !chartRef.current) return
+    chartRef.current.applyOptions(chartCanvasThemeOptions(chartUiTheme))
+  }, [chartUiTheme, chartReady])
+
+  useEffect(() => {
+    try {
+      globalThis.localStorage?.setItem(LS_CHART_UI_THEME, chartUiTheme)
+    } catch {
+      /* ignore */
+    }
+  }, [chartUiTheme])
+
+  useEffect(() => {
+    try {
+      globalThis.localStorage?.setItem(LS_CHART_HISTORY_OVERLAY, showHistoryOnChart ? '1' : '0')
+    } catch {
+      /* ignore */
+    }
+  }, [showHistoryOnChart])
+
   const MAX_CHART_HISTORY_TRADES = 120
 
   useEffect(() => {
@@ -1166,6 +1234,12 @@ export function PlatformPage() {
     }
 
     if (!USE_SIGNALR_STREAM || platformTab !== 'chart') {
+      markersApi.setMarkers([])
+      clearConnectors()
+      return
+    }
+
+    if (!showHistoryOnChart) {
       markersApi.setMarkers([])
       clearConnectors()
       return
@@ -1263,7 +1337,7 @@ export function PlatformPage() {
       return String(a.id ?? '').localeCompare(String(b.id ?? ''))
     })
     markersApi.setMarkers(markers)
-  }, [serverHistoryRows, serverOpenPositions, symbol, platformTab, chartReady])
+  }, [serverHistoryRows, serverOpenPositions, symbol, platformTab, chartReady, showHistoryOnChart])
 
   useEffect(() => {
     if (!USE_SIGNALR_STREAM) {
@@ -2188,6 +2262,33 @@ export function PlatformPage() {
   const sellFmt = sellPx != null ? formatMtPrice(sellPx) : { head: '—', sup: '' as string }
   const buyFmt = buyPx != null ? formatMtPrice(buyPx) : { head: '—', sup: '' as string }
 
+  const shell = useMemo(() => {
+    const dark = chartUiTheme === 'dark'
+    return {
+      pageBg: dark ? '#0d0d0d' : '#f3f4f6',
+      orderBarBorder: dark ? '#1f1f1f' : '#e5e7eb',
+      tfBorder: dark ? '#404040' : '#cbd5e1',
+      tfBg: dark ? 'rgba(23,23,23,0.88)' : 'rgba(255,255,255,0.94)',
+      tfMuted: dark ? '#a3a3a3' : '#64748b',
+      tfActive: dark ? '#e5e5e5' : '#0f172a',
+      toggleBorder: dark ? '#525252' : '#cbd5e1',
+      toggleBg: dark ? 'rgba(38,38,38,0.95)' : 'rgba(255,255,255,0.98)',
+      toggleText: dark ? '#e5e5e5' : '#0f172a',
+      tabBarBg: dark ? '#111' : '#e5e7eb',
+      tabBarBorder: dark ? '#2a2a2a' : '#d1d5db',
+      tabSelectedBg: dark ? '#1a1a1a' : '#ffffff',
+      tabMuted: dark ? '#888' : '#64748b',
+      tabActive: dark ? '#e5e5e5' : '#0f172a',
+      historyPanelBg: dark ? '#0d0d0d' : '#f8fafc',
+      historyHeading: dark ? '#fafafa' : '#0f172a',
+      historyMuted: dark ? '#a3a3a3' : '#64748b',
+      historySectionTitle: dark ? '#fafafa' : '#0f172a',
+      historyTableText: dark ? '#e5e5e5' : '#1e293b',
+      historyRowBorder: dark ? '#2a2a2a' : '#e2e8f0',
+      historyThBorder: dark ? '#333' : '#e2e8f0',
+    }
+  }, [chartUiTheme])
+
   const mtSellBg = '#b71c1c'
   const mtBuyBg = '#1565c0'
   const mtBarBtn = {
@@ -2213,7 +2314,7 @@ export function PlatformPage() {
         overscrollBehavior: 'none',
         display: 'flex',
         flexDirection: 'column',
-        background: '#0d0d0d',
+        background: shell.pageBg,
       }}
     >
       {showTradeForm && platformTab === 'chart' ? (
@@ -2223,7 +2324,7 @@ export function PlatformPage() {
               display: 'flex',
               flexDirection: 'row',
               alignItems: 'stretch',
-              borderBottom: '1px solid #1f1f1f',
+              borderBottom: `1px solid ${shell.orderBarBorder}`,
             }}
           >
             <button
@@ -2473,9 +2574,9 @@ export function PlatformPage() {
                     style={{
                       padding: '4px 8px',
                       borderRadius: 6,
-                      border: active ? '1px solid #1565c0' : '1px solid #404040',
-                      background: active ? 'rgba(21,101,192,0.35)' : 'rgba(23,23,23,0.88)',
-                      color: active ? '#e5e5e5' : '#a3a3a3',
+                      border: active ? '1px solid #1565c0' : `1px solid ${shell.tfBorder}`,
+                      background: active ? 'rgba(21,101,192,0.35)' : shell.tfBg,
+                      color: active ? shell.tfActive : shell.tfMuted,
                       fontSize: 11,
                       fontWeight: 600,
                       cursor: 'pointer',
@@ -2487,6 +2588,50 @@ export function PlatformPage() {
                   </button>
                 )
               })}
+              <button
+                type="button"
+                aria-pressed={chartUiTheme === 'light'}
+                aria-label="Switch chart between dark and light theme"
+                title={chartUiTheme === 'dark' ? 'Switch to light chart' : 'Switch to dark chart'}
+                onClick={() => setChartUiTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+                style={{
+                  marginLeft: 'auto',
+                  padding: '4px 8px',
+                  borderRadius: 6,
+                  border: `1px solid ${shell.toggleBorder}`,
+                  background: shell.toggleBg,
+                  color: shell.toggleText,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  WebkitTapHighlightColor: 'transparent',
+                  touchAction: 'manipulation',
+                }}
+              >
+                {chartUiTheme === 'dark' ? 'Light' : 'Dark'}
+              </button>
+              {USE_SIGNALR_STREAM ? (
+                <button
+                  type="button"
+                  aria-pressed={showHistoryOnChart}
+                  aria-label="Toggle trade history markers on chart"
+                  onClick={() => setShowHistoryOnChart((v) => !v)}
+                  style={{
+                    padding: '4px 8px',
+                    borderRadius: 6,
+                    border: `1px solid ${showHistoryOnChart ? '#1565c0' : shell.toggleBorder}`,
+                    background: showHistoryOnChart ? 'rgba(21,101,192,0.28)' : shell.toggleBg,
+                    color: shell.toggleText,
+                    fontSize: 11,
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    WebkitTapHighlightColor: 'transparent',
+                    touchAction: 'manipulation',
+                  }}
+                >
+                  {showHistoryOnChart ? 'History on' : 'History off'}
+                </button>
+              ) : null}
             </div>
         <div
           ref={overlayRef}
@@ -2831,38 +2976,39 @@ export function PlatformPage() {
             WebkitOverflowScrolling: 'touch',
             visibility: platformTab === 'history' ? 'visible' : 'hidden',
             pointerEvents: platformTab === 'history' ? 'auto' : 'none',
-            background: '#0d0d0d',
+            background: shell.historyPanelBg,
             padding: 12,
+            color: shell.historyTableText,
           }}
         >
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-            <div style={{ fontWeight: 700, color: '#fafafa' }}>History</div>
-            <div style={{ fontSize: 12, color: '#a3a3a3' }}>
+            <div style={{ fontWeight: 700, color: shell.historyHeading }}>History</div>
+            <div style={{ fontSize: 12, color: shell.historyMuted }}>
               Live price: {latestPrice ? latestPrice.toFixed(2) : '—'}
             </div>
           </div>
 
           {USE_SIGNALR_STREAM ? (
             <>
-              <div style={{ marginTop: 14, fontWeight: 600, color: '#fafafa', fontSize: 13 }}>
+              <div style={{ marginTop: 14, fontWeight: 600, color: shell.historySectionTitle, fontSize: 13 }}>
                 Open positions (tap to close)
               </div>
-              <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 8, color: '#e5e5e5' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 8, color: shell.historyTableText }}>
                 <thead>
-                  <tr style={{ textAlign: 'left', fontSize: 12, color: '#a3a3a3' }}>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Ticket</th>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Symbol</th>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Side</th>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Lots</th>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Open</th>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>P/L</th>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Opened</th>
+                  <tr style={{ textAlign: 'left', fontSize: 12, color: shell.historyMuted }}>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Ticket</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Symbol</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Side</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Lots</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Open</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>P/L</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Opened</th>
                   </tr>
                 </thead>
                 <tbody>
                   {serverOpenPositions.length === 0 ? (
                     <tr>
-                      <td style={{ padding: 10, color: '#a3a3a3' }} colSpan={7}>
+                      <td style={{ padding: 10, color: shell.historyMuted }} colSpan={7}>
                         No open positions.
                       </td>
                     </tr>
@@ -2891,7 +3037,7 @@ export function PlatformPage() {
                           setHistoryCloseModal(o)
                         }}
                         style={{
-                          borderBottom: '1px solid #2a2a2a',
+                          borderBottom: `1px solid ${shell.historyRowBorder}`,
                           cursor: 'pointer',
                         }}
                       >
@@ -2909,10 +3055,10 @@ export function PlatformPage() {
                         >
                           {displayPnl.toFixed(2)}
                           {isXau && clientPnl != null ? (
-                            <span style={{ fontSize: 10, fontWeight: 500, color: '#737373' }}> (est.)</span>
+                            <span style={{ fontSize: 10, fontWeight: 500, color: shell.historyMuted }}> (est.)</span>
                           ) : null}
                         </td>
-                        <td style={{ padding: '8px 6px', fontSize: 12, color: '#a3a3a3' }}>
+                        <td style={{ padding: '8px 6px', fontSize: 12, color: shell.historyMuted }}>
                           {o.openTime ? new Date(o.openTime).toLocaleString() : '—'}
                         </td>
                       </tr>
@@ -2922,32 +3068,32 @@ export function PlatformPage() {
                 </tbody>
               </table>
 
-              <div style={{ marginTop: 18, fontWeight: 600, color: '#fafafa', fontSize: 13 }}>
+              <div style={{ marginTop: 18, fontWeight: 600, color: shell.historySectionTitle, fontSize: 13 }}>
                 Closed (account history)
               </div>
-              <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 8, color: '#e5e5e5' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 8, color: shell.historyTableText }}>
                 <thead>
-                  <tr style={{ textAlign: 'left', fontSize: 12, color: '#a3a3a3' }}>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Ticket</th>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Symbol</th>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Side</th>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Lots</th>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Open</th>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Close</th>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>P/L</th>
-                    <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Closed</th>
+                  <tr style={{ textAlign: 'left', fontSize: 12, color: shell.historyMuted }}>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Ticket</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Symbol</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Side</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Lots</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Open</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Close</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>P/L</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Closed</th>
                   </tr>
                 </thead>
                 <tbody>
                   {serverHistoryRows.length === 0 ? (
                     <tr>
-                      <td style={{ padding: 10, color: '#a3a3a3' }} colSpan={8}>
+                      <td style={{ padding: 10, color: shell.historyMuted }} colSpan={8}>
                         No closed trades in snapshot.
                       </td>
                     </tr>
                   ) : (
                     serverHistoryRows.map((r) => (
-                      <tr key={`${r.ticket}-${r.closeTime}`} style={{ borderBottom: '1px solid #2a2a2a' }}>
+                      <tr key={`${r.ticket}-${r.closeTime}`} style={{ borderBottom: `1px solid ${shell.historyRowBorder}` }}>
                         <td style={{ padding: '8px 6px', fontSize: 12 }}>{r.ticket}</td>
                         <td style={{ padding: '8px 6px' }}>{r.symbol}</td>
                         <td style={{ padding: '8px 6px' }}>{r.type === 0 ? 'BUY' : 'SELL'}</td>
@@ -2963,7 +3109,7 @@ export function PlatformPage() {
                         >
                           {r.profit.toFixed(2)}
                         </td>
-                        <td style={{ padding: '8px 6px', fontSize: 12, color: '#a3a3a3' }}>
+                        <td style={{ padding: '8px 6px', fontSize: 12, color: shell.historyMuted }}>
                           {r.closeTime ? new Date(r.closeTime).toLocaleString() : '—'}
                         </td>
                       </tr>
@@ -3039,22 +3185,22 @@ export function PlatformPage() {
               ) : null} */}
             </>
           ) : (
-            <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 8, color: '#e5e5e5' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 8, color: shell.historyTableText }}>
               <thead>
-                <tr style={{ textAlign: 'left', fontSize: 12, color: '#a3a3a3' }}>
-                  <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Time</th>
-                  <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Symbol</th>
-                  <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Side</th>
-                  <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Lot</th>
-                  <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>Entry</th>
-                  <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>TP / SL</th>
-                  <th style={{ padding: '8px 6px', borderBottom: '1px solid #333' }}>PnL</th>
+                <tr style={{ textAlign: 'left', fontSize: 12, color: shell.historyMuted }}>
+                  <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Time</th>
+                  <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Symbol</th>
+                  <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Side</th>
+                  <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Lot</th>
+                  <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Entry</th>
+                  <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>TP / SL</th>
+                  <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>PnL</th>
                 </tr>
               </thead>
               <tbody>
                 {tradeHistory.length === 0 ? (
                   <tr>
-                    <td style={{ padding: 10, color: '#a3a3a3' }} colSpan={7}>
+                    <td style={{ padding: 10, color: shell.historyMuted }} colSpan={7}>
                       No trades yet.
                     </td>
                   </tr>
@@ -3071,15 +3217,15 @@ export function PlatformPage() {
                       t.slPrice != null &&
                       (t.side === 'BUY' ? current <= t.slPrice : current >= t.slPrice)
                     return (
-                      <tr key={t.id} style={{ borderBottom: '1px solid #2a2a2a' }}>
-                        <td style={{ padding: '8px 6px', fontSize: 12, color: '#a3a3a3' }}>
+                      <tr key={t.id} style={{ borderBottom: `1px solid ${shell.historyRowBorder}` }}>
+                        <td style={{ padding: '8px 6px', fontSize: 12, color: shell.historyMuted }}>
                           {new Date(t.openedAtIso).toLocaleString()}
                         </td>
                         <td style={{ padding: '8px 6px' }}>{t.symbol}</td>
                         <td style={{ padding: '8px 6px' }}>{t.side}</td>
                         <td style={{ padding: '8px 6px' }}>{t.lotSize}</td>
                         <td style={{ padding: '8px 6px' }}>{t.entryPrice.toFixed(2)}</td>
-                        <td style={{ padding: '8px 6px', fontSize: 12, color: '#a3a3a3' }}>
+                        <td style={{ padding: '8px 6px', fontSize: 12, color: shell.historyMuted }}>
                           {t.tpPrice != null ? (
                             <>
                               TP {t.tpPrice.toFixed(2)} {tpHit ? '(hit)' : ''}
@@ -3115,8 +3261,8 @@ export function PlatformPage() {
         style={{
           flexShrink: 0,
           display: 'flex',
-          borderTop: '1px solid #2a2a2a',
-          background: '#111',
+          borderTop: `1px solid ${shell.tabBarBorder}`,
+          background: shell.tabBarBg,
           paddingBottom: 'max(8px, env(safe-area-inset-bottom, 0px))',
         }}
       >
@@ -3130,8 +3276,8 @@ export function PlatformPage() {
             padding: '12px 10px',
             border: 'none',
             borderTop: platformTab === 'chart' ? '3px solid #1565c0' : '3px solid transparent',
-            background: platformTab === 'chart' ? '#1a1a1a' : 'transparent',
-            color: platformTab === 'chart' ? '#e5e5e5' : '#888',
+            background: platformTab === 'chart' ? shell.tabSelectedBg : 'transparent',
+            color: platformTab === 'chart' ? shell.tabActive : shell.tabMuted,
             fontSize: 13,
             fontWeight: 700,
             cursor: 'pointer',
@@ -3154,8 +3300,8 @@ export function PlatformPage() {
             padding: '12px 10px',
             border: 'none',
             borderTop: platformTab === 'history' ? '3px solid #1565c0' : '3px solid transparent',
-            background: platformTab === 'history' ? '#1a1a1a' : 'transparent',
-            color: platformTab === 'history' ? '#e5e5e5' : '#888',
+            background: platformTab === 'history' ? shell.tabSelectedBg : 'transparent',
+            color: platformTab === 'history' ? shell.tabActive : shell.tabMuted,
             fontSize: 13,
             fontWeight: 700,
             cursor: 'pointer',
