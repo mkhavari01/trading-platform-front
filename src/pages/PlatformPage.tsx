@@ -23,6 +23,15 @@ import type {
 const META_TRADER_SOUND_URL = '/metatrader.mp3'
 let metaTraderSoundAudio: HTMLAudioElement | null = null
 
+const VITE_SIGNALR_URL="http://localhost:5104/stream"
+const VITE_SIGNALR_ACCOUNT="5049518877"
+const VITE_SIGNALR_TERMINAL="MT5"
+const VITE_SIGNALR_SYMBOL="XAUUSD"
+const VITE_TERMINAL_TYPE="1"
+const VITE_OHLC_TIMEFRAME="1"
+const VITE_OHLC_HISTORY_DAYS="14"
+const VITE_OHLC_URL="http://localhost:5104/Manage/ohlc"
+
 function playMetaTraderTradeSound() {
   if (typeof window === 'undefined') return
   try {
@@ -142,13 +151,13 @@ async function fetchBinanceCandles({
 }
 
 /** MT stream: live `quote` ticks; history: POST `Manage/ohlc` (see `fetchMtOhlcCandles`). */
-const SIGNALR_URL = (import.meta.env.VITE_SIGNALR_URL as string | undefined)?.trim()
+const SIGNALR_URL = (VITE_SIGNALR_URL as string | undefined)?.trim()
 const SIGNALR_TERMINAL = (
-  (import.meta.env.VITE_SIGNALR_TERMINAL as string | undefined) ?? 'MT5'
+  (VITE_SIGNALR_TERMINAL as string | undefined) ?? 'MT5'
 ).trim()
-const SIGNALR_ACCOUNT = Number((import.meta.env.VITE_SIGNALR_ACCOUNT as string | undefined) ?? '')
+const SIGNALR_ACCOUNT = Number((VITE_SIGNALR_ACCOUNT as string | undefined) ?? '')
 const SIGNALR_DEFAULT_SYMBOL = (
-  (import.meta.env.VITE_SIGNALR_SYMBOL as string | undefined) ?? 'XAUUSD'
+  (VITE_SIGNALR_SYMBOL as string | undefined) ?? 'XAUUSD'
 )
   .trim()
   .toUpperCase()
@@ -168,7 +177,7 @@ function hubOriginFromUrl(hubUrl: string): string | null {
 }
 
 const OHLC_API_URL = (() => {
-  const explicit = (import.meta.env.VITE_OHLC_URL as string | undefined)?.trim()
+  const explicit = (VITE_OHLC_URL as string | undefined)?.trim()
   if (explicit) return explicit
   if (!SIGNALR_URL) return ''
   const origin = hubOriginFromUrl(SIGNALR_URL)
@@ -177,12 +186,12 @@ const OHLC_API_URL = (() => {
 
 const OHLC_HISTORY_DAYS = Math.max(
   1,
-  Number((import.meta.env.VITE_OHLC_HISTORY_DAYS as string | undefined) ?? '14') || 14,
+  Number((VITE_OHLC_HISTORY_DAYS as string | undefined) ?? '14') || 14,
 )
 
 const DEFAULT_CHART_TF_MINUTES = Math.max(
   1,
-  Number((import.meta.env.VITE_OHLC_TIMEFRAME as string | undefined) ?? '1') || 1,
+  Number((VITE_OHLC_TIMEFRAME as string | undefined) ?? '1') || 1,
 )
 
 /** MT `timeFrame` is minutes; must match `/Manage/ohlc`. */
@@ -270,7 +279,7 @@ function minutesToBinanceKlineInterval(minutes: number): string {
 
 const BROKER_TERMINAL_TYPE = Math.max(
   0,
-  Number((import.meta.env.VITE_TERMINAL_TYPE as string | undefined) ?? '1') || 1,
+  Number((VITE_TERMINAL_TYPE as string | undefined) ?? '1') || 1,
 )
 
 function manageOriginFromOhlcUrl(ohlcUrl: string): string | null {
