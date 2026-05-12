@@ -147,10 +147,43 @@ const OHLC_HISTORY_DAYS = Math.max(
   Number((import.meta.env.VITE_OHLC_HISTORY_DAYS as string | undefined) ?? '14') || 14,
 )
 
-const OHLC_TIMEFRAME = Math.max(
+const DEFAULT_CHART_TF_MINUTES = Math.max(
   1,
   Number((import.meta.env.VITE_OHLC_TIMEFRAME as string | undefined) ?? '1') || 1,
 )
+
+/** MT `timeFrame` is minutes; must match `/Manage/ohlc`. */
+const CHART_TF_OPTIONS = [
+  { label: '1m', minutes: 1 },
+  { label: '5m', minutes: 5 },
+  { label: '15m', minutes: 15 },
+  { label: '30m', minutes: 30 },
+  { label: '1H', minutes: 60 },
+  { label: '4H', minutes: 240 },
+  { label: '1D', minutes: 1440 },
+] as const
+
+function normalizeChartTfMinutes(m: number): (typeof CHART_TF_OPTIONS)[number]['minutes'] {
+  const hit = CHART_TF_OPTIONS.find((o) => o.minutes === m)
+  return hit ? hit.minutes : 1
+}
+
+function minutesToBinanceKlineInterval(minutes: number): string {
+  const map: Record<number, string> = {
+    1: '1m',
+    3: '3m',
+    5: '5m',
+    15: '15m',
+    30: '30m',
+    60: '1h',
+    120: '2h',
+    240: '4h',
+    360: '6h',
+    720: '12h',
+    1440: '1d',
+  }
+  return map[minutes] ?? '1m'
+}
 
 const BROKER_TERMINAL_TYPE = Math.max(
   0,
@@ -414,7 +447,9 @@ export function PlatformPage() {
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [symbol, setSymbol] = useState(DEFAULT_CHART_SYMBOL)
-  const interval = '1m' as const
+  const [chartTfMinutes, setChartTfMinutes] = useState(() =>
+    normalizeChartTfMinutes(DEFAULT_CHART_TF_MINUTES),
+  )
   const [lotSize, setLotSize] = useState('0.01')
   const [tradeError, setTradeError] = useState<string | null>(null)
   const [showTradeForm, setShowTradeForm] = useState(true)
@@ -810,7 +845,7 @@ export function PlatformPage() {
         try {
           const data = await fetchBinanceCandles({
             symbol,
-            interval,
+            interval: minutesToBinanceKlineInterval(chartTfMinutes),
             limit: 500,
             signal: controller.signal,
           })
@@ -894,7 +929,7 @@ export function PlatformPage() {
           symbol: sym,
           fromIso,
           toIso,
-          timeFrame: OHLC_TIMEFRAME,
+          timeFrame: chartTfMinutes,
           signal: controller.signal,
         })
 
@@ -946,7 +981,7 @@ export function PlatformPage() {
       mtOhlcLoadedRef.current = false
       lastOhlcBarRef.current = null
     }
-  }, [sampleCandles, symbol])
+  }, [sampleCandles, symbol, chartTfMinutes])
 
   useEffect(() => {
     if (USE_SIGNALR_STREAM) return
@@ -958,7 +993,8 @@ export function PlatformPage() {
     wsRef.current?.close()
     wsRef.current = null
 
-    const stream = `${symbol.toLowerCase()}@kline_1m`
+    const klineIv = minutesToBinanceKlineInterval(chartTfMinutes)
+    const stream = `${symbol.toLowerCase()}@kline_${klineIv}`
     const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${stream}`)
     wsRef.current = ws
 
@@ -988,19 +1024,20 @@ export function PlatformPage() {
     }
 
     ws.onerror = () => {
-      setError((prev) => prev ?? 'WebSocket error while streaming 1m candles.')
+      setError((prev) => prev ?? `WebSocket error while streaming ${klineIv} candles.`)
     }
 
     return () => {
       ws.close()
       if (wsRef.current === ws) wsRef.current = null
     }
-  }, [symbol])
+  }, [symbol, chartTfMinutes])
 
   useEffect(() => {
     if (!USE_SIGNALR_STREAM || !SIGNALR_URL) return
 
     let cancelled = false
+    const tfMin = chartTfMinutes
 
     const hub = new signalR.HubConnectionBuilder()
       .withUrl(SIGNALR_URL, {
@@ -1045,7 +1082,7 @@ export function PlatformPage() {
       const timeMs = data.timeIso ? Date.parse(data.timeIso) : Date.now()
       if (Number.isNaN(timeMs)) return
 
-      const barDurSec = OHLC_TIMEFRAME * 60
+      const barDurSec = tfMin * 60
       const barTimeSec = Math.floor(timeMs / 1000 / barDurSec) * barDurSec
       const mid = (data.bid + data.ask) / 2
 
@@ -1131,7 +1168,7 @@ export function PlatformPage() {
       const s = seriesRef.current
       if (s) s.setData([])
     }
-  }, [symbol])
+  }, [symbol, chartTfMinutes])
 
   /** Log when bid/ask hits TP or SL; trades stay open (no removal). */
   useEffect(() => {
@@ -1613,6 +1650,44 @@ export function PlatformPage() {
             }}
           >
             <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
+            <div
+              style={{
+                position: 'absolute',
+                left: 8,
+                top: 8,
+                zIndex: 12,
+                display: 'flex',
+                flexWrap: 'wrap',
+                gap: 4,
+                maxWidth: 'calc(100% - 16px)',
+                pointerEvents: 'auto',
+              }}
+            >
+              {CHART_TF_OPTIONS.map((opt) => {
+                const active = chartTfMinutes === opt.minutes
+                return (
+                  <button
+                    key={opt.minutes}
+                    type="button"
+                    onClick={() => setChartTfMinutes(opt.minutes)}
+                    style={{
+                      padding: '4px 8px',
+                      borderRadius: 6,
+                      border: active ? '1px solid #1565c0' : '1px solid #404040',
+                      background: active ? 'rgba(21,101,192,0.35)' : 'rgba(23,23,23,0.88)',
+                      color: active ? '#e5e5e5' : '#a3a3a3',
+                      fontSize: 11,
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      WebkitTapHighlightColor: 'transparent',
+                      touchAction: 'manipulation',
+                    }}
+                  >
+                    {opt.label}
+                  </button>
+                )
+              })}
+            </div>
         <div
           ref={overlayRef}
           aria-hidden={!selectedTradeId}
