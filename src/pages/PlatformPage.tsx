@@ -1,3 +1,4 @@
+import * as signalR from '@microsoft/signalr'
 import { useDrag } from '@use-gesture/react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { CandlestickSeries, createChart, CrosshairMode } from 'lightweight-charts'
@@ -107,6 +108,169 @@ async function fetchBinanceCandles({
   })
 }
 
+/** MT stream: live `quote` ticks; history: POST `Manage/ohlc` (see `fetchMtOhlcCandles`). */
+const SIGNALR_URL = (import.meta.env.VITE_SIGNALR_URL as string | undefined)?.trim()
+const SIGNALR_TERMINAL = (
+  (import.meta.env.VITE_SIGNALR_TERMINAL as string | undefined) ?? 'MT5'
+).trim()
+const SIGNALR_ACCOUNT = Number((import.meta.env.VITE_SIGNALR_ACCOUNT as string | undefined) ?? '')
+const SIGNALR_DEFAULT_SYMBOL = (
+  (import.meta.env.VITE_SIGNALR_SYMBOL as string | undefined) ?? 'XAUUSD'
+)
+  .trim()
+  .toUpperCase()
+
+const USE_SIGNALR_STREAM = Boolean(
+  SIGNALR_URL && Number.isFinite(SIGNALR_ACCOUNT) && SIGNALR_ACCOUNT > 0,
+)
+
+const DEFAULT_CHART_SYMBOL = USE_SIGNALR_STREAM ? SIGNALR_DEFAULT_SYMBOL : 'BTCUSDT'
+
+function hubOriginFromUrl(hubUrl: string): string | null {
+  try {
+    return new URL(hubUrl).origin
+  } catch {
+    return null
+  }
+}
+
+const OHLC_API_URL = (() => {
+  const explicit = (import.meta.env.VITE_OHLC_URL as string | undefined)?.trim()
+  if (explicit) return explicit
+  if (!SIGNALR_URL) return ''
+  const origin = hubOriginFromUrl(SIGNALR_URL)
+  return origin ? `${origin}/Manage/ohlc` : ''
+})()
+
+const OHLC_HISTORY_DAYS = Math.max(
+  1,
+  Number((import.meta.env.VITE_OHLC_HISTORY_DAYS as string | undefined) ?? '14') || 14,
+)
+
+const OHLC_TIMEFRAME = Math.max(
+  1,
+  Number((import.meta.env.VITE_OHLC_TIMEFRAME as string | undefined) ?? '1') || 1,
+)
+
+const BROKER_TERMINAL_TYPE = Math.max(
+  0,
+  Number((import.meta.env.VITE_TERMINAL_TYPE as string | undefined) ?? '1') || 1,
+)
+
+function manageOriginFromOhlcUrl(ohlcUrl: string): string | null {
+  try {
+    return new URL(ohlcUrl).origin
+  } catch {
+    return null
+  }
+}
+
+type BrokerServerTimeResponse = {
+  statusCode?: number
+  message?: string
+  brokerServerTime?: string
+}
+
+/** GET /Manage/broker-server-time — use `brokerServerTime` as OHLC `to` (broker clock, not browser). */
+async function fetchBrokerServerTime(opts: {
+  manageOrigin: string
+  terminalType: number
+  accountNumber: number
+  signal?: AbortSignal
+}): Promise<string> {
+  const q = new URLSearchParams({
+    terminalType: String(opts.terminalType),
+    accountNumber: String(opts.accountNumber),
+  })
+  const url = `${opts.manageOrigin}/Manage/broker-server-time?${q.toString()}`
+  const res = await fetch(url, {
+    method: 'GET',
+    credentials: 'omit',
+    signal: opts.signal,
+  })
+  if (!res.ok) {
+    throw new Error(`Broker server time failed (${res.status})`)
+  }
+  const json = (await res.json()) as BrokerServerTimeResponse
+  const raw = json.brokerServerTime
+  if (typeof raw !== 'string' || !raw.trim()) {
+    throw new Error('Broker server time response missing brokerServerTime')
+  }
+  return raw.trim()
+}
+
+/** Normalize broker ISO string to OHLC payload `to` / `from` shape (UTC, no sub-second). */
+function brokerTimeToOhlcIso(brokerIso: string): string {
+  const ms = Date.parse(brokerIso)
+  if (Number.isNaN(ms)) {
+    throw new Error(`Invalid brokerServerTime: ${brokerIso}`)
+  }
+  return new Date(ms).toISOString().slice(0, 19)
+}
+
+type MtOhlcRow = {
+  time: string
+  open: number
+  high: number
+  low: number
+  close: number
+}
+
+type MtOhlcResponse = {
+  data?: MtOhlcRow[]
+}
+
+async function fetchMtOhlcCandles(opts: {
+  url: string
+  account: number
+  symbol: string
+  fromIso: string
+  toIso: string
+  timeFrame: number
+  signal?: AbortSignal
+}): Promise<Candle[]> {
+  const res = await fetch(opts.url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      account: opts.account,
+      symbol: opts.symbol,
+      from: opts.fromIso,
+      to: opts.toIso,
+      timeFrame: opts.timeFrame,
+    }),
+    credentials: 'omit',
+    signal: opts.signal,
+  })
+  if (!res.ok) {
+    throw new Error(`OHLC request failed (${res.status})`)
+  }
+  const json = (await res.json()) as MtOhlcResponse
+  const rows = json.data ?? []
+  const out: Candle[] = []
+  for (const r of rows) {
+    if (typeof r.time !== 'string') continue
+    const ms = Date.parse(r.time)
+    if (Number.isNaN(ms)) continue
+    const t = Math.floor(ms / 1000)
+    out.push({
+      time: t,
+      open: Number(r.open),
+      high: Number(r.high),
+      low: Number(r.low),
+      close: Number(r.close),
+    })
+  }
+  out.sort((a, b) => a.time - b.time)
+  const dedup: Candle[] = []
+  for (const c of out) {
+    const prev = dedup[dedup.length - 1]
+    if (prev && prev.time === c.time) dedup[dedup.length - 1] = c
+    else dedup.push(c)
+  }
+  return dedup
+}
+
 /** MT-style price: main body + last fractional digit as superscript (2 dp). */
 function formatMtPrice(value: number): { head: string; sup: string } {
   const [intPart, dec = ''] = value.toFixed(2).split('.')
@@ -206,7 +370,13 @@ export function PlatformPage() {
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
+  const signalRConnRef = useRef<signalR.HubConnection | null>(null)
   const lastKlineBarRef = useRef<{ high: number; low: number; close: number } | null>(null)
+  /** True after POST Manage/ohlc has populated the series (live ticks only extend/update after this). */
+  const mtOhlcLoadedRef = useRef(false)
+  const tickBarRef = useRef<Candle | null>(null)
+  /** Last candle from Manage/ohlc: first stream ticks in the same bucket merge into it (preserve open). */
+  const lastOhlcBarRef = useRef<Candle | null>(null)
   /** Latest exit-hit reason per trade (for logging only; no auto-close). */
   const lastExitHitReasonRef = useRef<Map<string, ExitReason | null>>(new Map())
   const priceLinesRef = useRef<
@@ -232,7 +402,7 @@ export function PlatformPage() {
       openedAtIso: string
     }>
   >([])
-  const symbolRef = useRef<string>('BTCUSDT')
+  const symbolRef = useRef<string>(DEFAULT_CHART_SYMBOL)
   const selectedTradeIdRef = useRef<string | null>(null)
   type PriceLineHitFn = (
     series: ISeriesApi<'Candlestick'>,
@@ -243,12 +413,13 @@ export function PlatformPage() {
 
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
-  const [symbol, setSymbol] = useState('BTCUSDT')
+  const [symbol, setSymbol] = useState(DEFAULT_CHART_SYMBOL)
   const interval = '1m' as const
   const [lotSize, setLotSize] = useState('0.01')
   const [tradeError, setTradeError] = useState<string | null>(null)
   const [showTradeForm, setShowTradeForm] = useState(true)
   const [latestPrice, setLatestPrice] = useState<number | null>(null)
+  const [liveQuote, setLiveQuote] = useState<{ bid: number; ask: number } | null>(null)
   const [selectedTradeId, setSelectedTradeId] = useState<string | null>(null)
   const [hideTpSlDragHint, setHideTpSlDragHint] = useState(readHideTpSlDragHint)
   const [platformTab, setPlatformTab] = useState<'chart' | 'history'>('chart')
@@ -630,57 +801,156 @@ export function PlatformPage() {
   }, [])
 
   useEffect(() => {
+    if (!USE_SIGNALR_STREAM) {
+      const controller = new AbortController()
+      setLoading(true)
+      setError(null)
+
+      async function load() {
+        try {
+          const data = await fetchBinanceCandles({
+            symbol,
+            interval,
+            limit: 500,
+            signal: controller.signal,
+          })
+
+          const series = seriesRef.current
+          const chart = chartRef.current
+          if (series && chart) {
+            series.setData(
+              data.map((c) => ({
+                ...c,
+                time: c.time as UTCTimestamp,
+              })),
+            )
+            chart.timeScale().fitContent()
+          }
+        } catch (e) {
+          const message = e instanceof Error ? e.message : 'Unknown error'
+          setError(
+            `${message}. Falling back to sample data (your network may be blocking the exchange API).`,
+          )
+
+          const series = seriesRef.current
+          const chart = chartRef.current
+          if (series && chart) {
+            series.setData(
+              sampleCandles.map((c) => ({
+                ...c,
+                time: c.time as UTCTimestamp,
+              })),
+            )
+            chart.timeScale().fitContent()
+          }
+        } finally {
+          setLoading(false)
+        }
+      }
+
+      load()
+      return () => controller.abort()
+    }
+
     const controller = new AbortController()
+    mtOhlcLoadedRef.current = false
+    lastOhlcBarRef.current = null
     setLoading(true)
     setError(null)
 
-    async function load() {
+    if (!OHLC_API_URL) {
+      setError('Configure VITE_SIGNALR_URL or VITE_OHLC_URL to load MT history.')
+      setLoading(false)
+      const series = seriesRef.current
+      if (series) series.setData([])
+      return () => controller.abort()
+    }
+
+    async function loadMtOhlc() {
       try {
-        const data = await fetchBinanceCandles({
-          symbol,
-          interval,
-          limit: 500,
+        const manageOrigin = manageOriginFromOhlcUrl(OHLC_API_URL)
+        if (!manageOrigin) {
+          throw new Error('Invalid OHLC URL (cannot resolve API origin)')
+        }
+
+        const brokerRaw = await fetchBrokerServerTime({
+          manageOrigin,
+          terminalType: BROKER_TERMINAL_TYPE,
+          accountNumber: SIGNALR_ACCOUNT,
+          signal: controller.signal,
+        })
+        const toIso = brokerTimeToOhlcIso(brokerRaw)
+
+        const toMs = Date.parse(`${toIso}Z`)
+        if (Number.isNaN(toMs)) {
+          throw new Error('Invalid OHLC `to` timestamp')
+        }
+        const fromIso = new Date(toMs - OHLC_HISTORY_DAYS * 86_400_000).toISOString().slice(0, 19)
+        const sym = symbol.trim().toUpperCase()
+
+        const data = await fetchMtOhlcCandles({
+          url: OHLC_API_URL,
+          account: SIGNALR_ACCOUNT,
+          symbol: sym,
+          fromIso,
+          toIso,
+          timeFrame: OHLC_TIMEFRAME,
           signal: controller.signal,
         })
 
-        const series = seriesRef.current
-        const chart = chartRef.current
-        if (series && chart) {
-          series.setData(
-            data.map((c) => ({
-              ...c,
-              time: c.time as UTCTimestamp,
-            })),
-          )
-          chart.timeScale().fitContent()
-        }
-      } catch (e) {
-        const message = e instanceof Error ? e.message : 'Unknown error'
-        setError(
-          `${message}. Falling back to sample data (your network may be blocking the exchange API).`,
-        )
+        if (controller.signal.aborted) return
 
         const series = seriesRef.current
         const chart = chartRef.current
         if (series && chart) {
-          series.setData(
-            sampleCandles.map((c) => ({
-              ...c,
-              time: c.time as UTCTimestamp,
-            })),
-          )
-          chart.timeScale().fitContent()
+          if (data.length === 0) {
+            series.setData([])
+            setError('No OHLC rows returned for this range.')
+            mtOhlcLoadedRef.current = false
+            lastOhlcBarRef.current = null
+          } else {
+            series.setData(
+              data.map((c) => ({
+                ...c,
+                time: c.time as UTCTimestamp,
+              })),
+            )
+            chart.timeScale().fitContent()
+            mtOhlcLoadedRef.current = true
+            const last = data[data.length - 1]
+            lastOhlcBarRef.current = { ...last }
+            lastKlineBarRef.current = {
+              high: last.high,
+              low: last.low,
+              close: last.close,
+            }
+            tickBarRef.current = null
+          }
         }
+      } catch (e) {
+        if (controller.signal.aborted) return
+        const message = e instanceof Error ? e.message : 'Unknown error'
+        setError(message)
+        mtOhlcLoadedRef.current = false
+        lastOhlcBarRef.current = null
+        const series = seriesRef.current
+        if (series) series.setData([])
       } finally {
-        setLoading(false)
+        if (!controller.signal.aborted) setLoading(false)
       }
     }
 
-    load()
-    return () => controller.abort()
+    void loadMtOhlc()
+    return () => {
+      controller.abort()
+      mtOhlcLoadedRef.current = false
+      lastOhlcBarRef.current = null
+    }
   }, [sampleCandles, symbol])
 
   useEffect(() => {
+    if (USE_SIGNALR_STREAM) return
+
     const series = seriesRef.current
     if (!series) return
 
@@ -724,6 +994,142 @@ export function PlatformPage() {
     return () => {
       ws.close()
       if (wsRef.current === ws) wsRef.current = null
+    }
+  }, [symbol])
+
+  useEffect(() => {
+    if (!USE_SIGNALR_STREAM || !SIGNALR_URL) return
+
+    let cancelled = false
+
+    const hub = new signalR.HubConnectionBuilder()
+      .withUrl(SIGNALR_URL, {
+        // `true` + `Allow-Origin: *` fails CORS; use `true` only with explicit origins on the API.
+        withCredentials: false,
+      })
+      .withAutomaticReconnect()
+      .build()
+
+    const subscribeQuotes = () =>
+      hub.invoke('Server', {
+        name: 'subscribeToQuote',
+        message: JSON.stringify({
+          terminal: SIGNALR_TERMINAL,
+          account: SIGNALR_ACCOUNT,
+          symbol: symbolRef.current,
+        }),
+      })
+
+    const onServer = (envelope: { name?: string; message?: string }) => {
+      if (!envelope || envelope.name !== 'quote') return
+      let data: {
+        terminal?: string
+        account?: number
+        symbol?: string
+        bid?: number
+        ask?: number
+        timeIso?: string
+      }
+      try {
+        data = JSON.parse(envelope.message ?? '{}')
+      } catch {
+        return
+      }
+      if (typeof data.symbol !== 'string') return
+      if (data.symbol.trim().toUpperCase() !== symbolRef.current.trim().toUpperCase()) return
+      if (typeof data.bid !== 'number' || typeof data.ask !== 'number') return
+
+      const seriesNow = seriesRef.current
+      if (!seriesNow || cancelled) return
+
+      const timeMs = data.timeIso ? Date.parse(data.timeIso) : Date.now()
+      if (Number.isNaN(timeMs)) return
+
+      const barDurSec = OHLC_TIMEFRAME * 60
+      const barTimeSec = Math.floor(timeMs / 1000 / barDurSec) * barDurSec
+      const mid = (data.bid + data.ask) / 2
+
+      setLiveQuote({ bid: data.bid, ask: data.ask })
+      setLatestPrice(mid)
+
+      if (!mtOhlcLoadedRef.current) return
+
+      let bar = tickBarRef.current
+      const histTail = lastOhlcBarRef.current
+      if (!bar || bar.time !== barTimeSec) {
+        if (histTail && histTail.time === barTimeSec) {
+          bar = {
+            time: barTimeSec,
+            open: histTail.open,
+            high: Math.max(histTail.high, data.ask, mid),
+            low: Math.min(histTail.low, data.bid, mid),
+            close: mid,
+          }
+          lastOhlcBarRef.current = null
+        } else {
+          bar = {
+            time: barTimeSec,
+            open: mid,
+            high: Math.max(mid, data.ask),
+            low: Math.min(mid, data.bid),
+            close: mid,
+          }
+        }
+      } else {
+        bar = {
+          time: bar.time,
+          open: bar.open,
+          high: Math.max(bar.high, data.ask, mid),
+          low: Math.min(bar.low, data.bid, mid),
+          close: mid,
+        }
+      }
+      tickBarRef.current = bar
+      seriesNow.update({
+        time: bar.time as UTCTimestamp,
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+      })
+      lastKlineBarRef.current = {
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+      }
+    }
+
+    hub.on('Server', onServer)
+    hub.onreconnected(() => {
+      void subscribeQuotes().catch(() => {})
+    })
+
+    void (async () => {
+      try {
+        await hub.start()
+        if (cancelled) {
+          await hub.stop()
+          return
+        }
+        signalRConnRef.current = hub
+        await subscribeQuotes()
+      } catch (e) {
+        if (!cancelled) {
+          const msg = e instanceof Error ? e.message : 'SignalR connection failed'
+          setError((prev) => prev ?? msg)
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+      signalRConnRef.current = null
+      tickBarRef.current = null
+      setLiveQuote(null)
+      hub.off('Server', onServer)
+      void hub.stop()
+      const s = seriesRef.current
+      if (s) s.setData([])
     }
   }, [symbol])
 
@@ -936,9 +1342,18 @@ export function PlatformPage() {
     })
   }
 
-  const tickSize = latestPrice != null ? syntheticHalfSpread(latestPrice) * 2 : 0
-  const sellPx = latestPrice != null ? latestPrice - tickSize / 2 : null
-  const buyPx = latestPrice != null ? latestPrice + tickSize / 2 : null
+  const streamSpread =
+    liveQuote != null && liveQuote.ask >= liveQuote.bid ? liveQuote.ask - liveQuote.bid : null
+  const tickSize =
+    streamSpread != null && streamSpread > 0
+      ? streamSpread
+      : latestPrice != null
+        ? syntheticHalfSpread(latestPrice) * 2
+        : 0
+  const sellPx =
+    liveQuote?.bid ?? (latestPrice != null && tickSize > 0 ? latestPrice - tickSize / 2 : null)
+  const buyPx =
+    liveQuote?.ask ?? (latestPrice != null && tickSize > 0 ? latestPrice + tickSize / 2 : null)
   const sellFmt = sellPx != null ? formatMtPrice(sellPx) : { head: '—', sup: '' as string }
   const buyFmt = buyPx != null ? formatMtPrice(buyPx) : { head: '—', sup: '' as string }
 
@@ -1131,7 +1546,7 @@ export function PlatformPage() {
           <input
             value={symbol}
             onChange={(e) => setSymbol(e.target.value.toUpperCase().trim())}
-            placeholder="BTCUSDT"
+            placeholder={USE_SIGNALR_STREAM ? 'XAUUSD' : 'BTCUSDT'}
             style={{
               padding: '6px 10px',
               borderRadius: 6,
