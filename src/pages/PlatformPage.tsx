@@ -252,6 +252,14 @@ function envName(envelope: {
   return { name, message }
 }
 
+/** Compare server TP/SL vs last `setSlTp` payload (0 = cleared). */
+function mtSlNearEqual(serverVal: number | null | undefined, sent: number): boolean {
+  if (sent === 0) return serverVal == null || serverVal === 0 || (typeof serverVal === 'number' && serverVal <= 0)
+  if (serverVal == null || !Number.isFinite(serverVal) || serverVal <= 0) return false
+  const tol = Math.max(0.05, 1e-5 * Math.abs(sent))
+  return Math.abs(serverVal - sent) <= tol
+}
+
 type AccountHistorySlice = {
   userOpenOrders: Record<string, unknown>[]
   userHistory: Record<string, unknown>[]
@@ -571,6 +579,10 @@ export function PlatformPage() {
     >
   >({})
   const draggingRef = useRef<null | { tradeId: string; kind: 'entry' | 'tp' | 'sl' }>(null)
+  /** True after the pointer moved during a TP/SL (or entry-split) drag; used to skip socket on tap-only. */
+  const tpSlDragMutatedRef = useRef(false)
+  /** Last `setSlTp` payload per ticket until account snapshot matches (avoids chart reverting on stale opens). */
+  const pendingMtSlTpByTicketRef = useRef(new Map<number, { takeProfit: number; stopLoss: number }>())
   const tradeHistoryRef = useRef<
     Array<{
       id: string
@@ -664,9 +676,9 @@ export function PlatformPage() {
     hitPx: number,
   ): { tradeId: string; kind: 'tp' | 'sl' | 'entry' } | null => {
     let best: { tradeId: string; kind: 'tp' | 'sl' | 'entry'; dist: number } | null = null
-    const sym = symbolRef.current
+    const sym = symbolRef.current.trim().toUpperCase()
     for (const t of tradeHistoryRef.current) {
-      if (t.symbol !== sym) continue
+      if (t.symbol.trim().toUpperCase() !== sym) continue
       const tpY = t.tpPrice != null ? series.priceToCoordinate(t.tpPrice) : null
       const slY = t.slPrice != null ? series.priceToCoordinate(t.slPrice) : null
       const entryY = series.priceToCoordinate(t.entryPrice)
@@ -788,7 +800,7 @@ export function PlatformPage() {
   }, [tradeHistory])
 
   useEffect(() => {
-    symbolRef.current = symbol
+    symbolRef.current = symbol.trim().toUpperCase()
   }, [symbol])
 
   useEffect(() => {
@@ -896,7 +908,20 @@ export function PlatformPage() {
       const HIT_PX = pointerType === 'touch' ? 28 : 16
 
       if (last) {
+        const ended = draggingRef.current
+        const didMutate = tpSlDragMutatedRef.current
         draggingRef.current = null
+        tpSlDragMutatedRef.current = false
+        if (
+          didMutate &&
+          USE_SIGNALR_STREAM &&
+          ended &&
+          ended.tradeId.startsWith('mt-') &&
+          (ended.kind === 'tp' || ended.kind === 'sl' || ended.kind === 'entry')
+        ) {
+          const t = tradeHistoryRef.current.find((x) => x.id === ended.tradeId)
+          if (t) pushMtSlTpToServer(t)
+        }
         return
       }
 
@@ -912,6 +937,7 @@ export function PlatformPage() {
 
         setSelectedTradeId(hit.tradeId)
         draggingRef.current = { tradeId: hit.tradeId, kind: hit.kind }
+        tpSlDragMutatedRef.current = false
         return
       }
 
@@ -919,6 +945,8 @@ export function PlatformPage() {
 
       const nextPrice = series.coordinateToPrice(y)
       if (nextPrice == null) return
+
+      tpSlDragMutatedRef.current = true
 
       const drag = draggingRef.current
       setTradeHistory((prev) => {
@@ -933,6 +961,8 @@ export function PlatformPage() {
             t.side === 'BUY' ? nextPrice >= t.entryPrice : nextPrice <= t.entryPrice
           return isTpDrag ? { ...t, tpPrice: nextPrice } : { ...t, slPrice: nextPrice }
         })
+
+        tradeHistoryRef.current = next
 
         const lines = priceLinesRef.current[drag.tradeId]
         const updated = next.find((t) => t.id === drag.tradeId)
@@ -1308,12 +1338,34 @@ export function PlatformPage() {
 
       const mtRows: ChartTradeRow[] = relevant.map((o) => {
         const side: 'BUY' | 'SELL' = o.type === 0 ? 'BUY' : 'SELL'
-        const tp =
-          o.takeProfit != null && o.takeProfit > 0
-            ? o.takeProfit
+        const srvTp = o.takeProfit != null && o.takeProfit > 0 ? o.takeProfit : null
+        const srvSl = o.stopLoss != null && o.stopLoss > 0 ? o.stopLoss : null
+
+        const pending = pendingMtSlTpByTicketRef.current.get(o.ticket)
+        let usePending = false
+        if (pending) {
+          const match = mtSlNearEqual(srvTp, pending.takeProfit) && mtSlNearEqual(srvSl, pending.stopLoss)
+          if (match) {
+            pendingMtSlTpByTicketRef.current.delete(o.ticket)
+          } else {
+            usePending = true
+          }
+        }
+
+        const tp = usePending
+          ? pending!.takeProfit > 0
+            ? pending!.takeProfit
             : defaultTpPrice(side, o.openPrice)
-        const sl =
-          o.stopLoss != null && o.stopLoss > 0 ? o.stopLoss : defaultSlPrice(side, o.openPrice)
+          : srvTp != null
+            ? srvTp
+            : defaultTpPrice(side, o.openPrice)
+        const sl = usePending
+          ? pending!.stopLoss > 0
+            ? pending!.stopLoss
+            : defaultSlPrice(side, o.openPrice)
+          : srvSl != null
+            ? srvSl
+            : defaultSlPrice(side, o.openPrice)
         const openedAtIso = (() => {
           const ms = Date.parse(o.openTime)
           return Number.isFinite(ms) ? new Date(ms).toISOString() : new Date().toISOString()
@@ -1422,6 +1474,10 @@ export function PlatformPage() {
           }
           for (const id of removedIds) {
             lastExitHitReasonRef.current.delete(id)
+            if (id.startsWith('mt-')) {
+              const tk = Number(id.slice(3))
+              if (Number.isFinite(tk)) pendingMtSlTpByTicketRef.current.delete(tk)
+            }
           }
           tradeHistoryRef.current = nextChart
           setTradeHistory(nextChart)
@@ -1459,6 +1515,26 @@ export function PlatformPage() {
           pendingOpenTradeRef.current = null
           setTradeError(null)
         }
+        void requestSnapshot().catch(() => {})
+        return
+      }
+
+      if (name === 'setsltpresult') {
+        let parsed: Record<string, unknown>
+        try {
+          parsed = JSON.parse(msg || '{}') as Record<string, unknown>
+        } catch {
+          return
+        }
+        console.log(parsed)
+        const errMsg =
+          (typeof parsed.message === 'string' && parsed.message) ||
+          (typeof parsed.error === 'string' && parsed.error) ||
+          (typeof parsed.Message === 'string' && parsed.Message) ||
+          (typeof parsed.Error === 'string' && parsed.Error) ||
+          null
+        const failed = parsed.success === false || parsed.Success === false
+        if (failed) setTradeError(errMsg ?? 'TP/SL update was rejected.')
         void requestSnapshot().catch(() => {})
         return
       }
@@ -1604,14 +1680,14 @@ export function PlatformPage() {
         low: latestPrice,
         close: latestPrice,
       }
-    const sym = symbolRef.current
+    const sym = symbolRef.current.trim().toUpperCase()
     const activeIds = new Set(tradeHistoryRef.current.map((t) => t.id))
     for (const id of lastExitHitReasonRef.current.keys()) {
       if (!activeIds.has(id)) lastExitHitReasonRef.current.delete(id)
     }
 
     for (const t of tradeHistoryRef.current) {
-      if (t.symbol !== sym) continue
+      if (t.symbol.trim().toUpperCase() !== sym) continue
       const reason = exitHitForTrade(t, bar)
       const prev = lastExitHitReasonRef.current.get(t.id) ?? null
       if (reason != null && reason !== prev) {
@@ -1716,6 +1792,41 @@ export function PlatformPage() {
     console.log('OPEN_TRADE', trade)
   }
 
+  /** Push TP/SL for a server-synced chart row (`mt-{ticket}`) to the trade hub. */
+  const pushMtSlTpToServer = (t: {
+    id: string
+    tpPrice: number | null
+    slPrice: number | null
+  }) => {
+    if (!USE_SIGNALR_STREAM) return
+    if (!t.id.startsWith('mt-')) return
+    const ticket = Number(t.id.slice(3))
+    if (!Number.isFinite(ticket) || ticket <= 0) return
+    const hub = signalRConnRef.current
+    if (!hub || hub.state !== signalR.HubConnectionState.Connected) {
+      setTradeError('Not connected to the trade server.')
+      return
+    }
+    const takeProfit = t.tpPrice != null && Number.isFinite(t.tpPrice) && t.tpPrice > 0 ? t.tpPrice : 0
+    const stopLoss = t.slPrice != null && Number.isFinite(t.slPrice) && t.slPrice > 0 ? t.slPrice : 0
+    pendingMtSlTpByTicketRef.current.set(ticket, { takeProfit, stopLoss })
+    void hub
+      .invoke('Server', {
+        name: 'setSlTp',
+        message: JSON.stringify({
+          terminalType: SIGNALR_TERMINAL,
+          accountNumber: SIGNALR_ACCOUNT,
+          ticket,
+          stopLoss,
+          takeProfit,
+        }),
+      })
+      .catch((e) => {
+        pendingMtSlTpByTicketRef.current.delete(ticket)
+        setTradeError(e instanceof Error ? e.message : 'setSlTp failed')
+      })
+  }
+
   const submitServerPositionClose = (mode: 'full' | 'partial') => {
     const pos = historyCloseModal
     const hub = signalRConnRef.current
@@ -1769,6 +1880,8 @@ export function PlatformPage() {
       tradeHistoryRef.current = next
       return next
     })
+    const updated = tradeHistoryRef.current.find((x) => x.id === tradeId)
+    if (updated && tradeId.startsWith('mt-')) pushMtSlTpToServer(updated)
     const series = seriesRef.current
     const lines = priceLinesRef.current[tradeId]
     if (series && lines?.tp) {
@@ -1784,6 +1897,8 @@ export function PlatformPage() {
       tradeHistoryRef.current = next
       return next
     })
+    const updated = tradeHistoryRef.current.find((x) => x.id === tradeId)
+    if (updated && tradeId.startsWith('mt-')) pushMtSlTpToServer(updated)
     const series = seriesRef.current
     const lines = priceLinesRef.current[tradeId]
     if (series && lines?.sl) {
@@ -1804,6 +1919,8 @@ export function PlatformPage() {
       tradeHistoryRef.current = next
       return next
     })
+    const after = tradeHistoryRef.current.find((x) => x.id === tradeId)
+    if (after && tradeId.startsWith('mt-')) pushMtSlTpToServer(after)
     const lines = priceLinesRef.current[tradeId]
     if (lines?.tp) {
       lines.tp.applyOptions({ price: tpPrice })
@@ -1831,6 +1948,8 @@ export function PlatformPage() {
       tradeHistoryRef.current = next
       return next
     })
+    const after = tradeHistoryRef.current.find((x) => x.id === tradeId)
+    if (after && tradeId.startsWith('mt-')) pushMtSlTpToServer(after)
     const lines = priceLinesRef.current[tradeId]
     if (lines?.sl) {
       lines.sl.applyOptions({ price: slPrice })
