@@ -281,6 +281,8 @@ type MtServerOpenPosition = {
   openPrice: number
   profit: number
   openTime: string
+  takeProfit: number | null
+  stopLoss: number | null
 }
 
 type MtServerHistoryRow = {
@@ -304,7 +306,19 @@ function mapServerOpen(raw: Record<string, unknown>): MtServerOpenPosition | nul
   const openPrice = Number(raw.OpenPrice ?? raw.openPrice ?? 0)
   const profit = Number(raw.Profit ?? raw.profit ?? 0)
   const openTime = String(raw.OpenTime ?? raw.openTime ?? '')
-  return { ticket, symbol, lots, type, openPrice, profit, openTime }
+  const tp = Number(raw.TakeProfit ?? raw.takeProfit ?? raw.Takeprofit ?? 0)
+  const sl = Number(raw.StopLoss ?? raw.stopLoss ?? 0)
+  return {
+    ticket,
+    symbol,
+    lots,
+    type,
+    openPrice,
+    profit,
+    openTime,
+    takeProfit: Number.isFinite(tp) && tp > 0 ? tp : null,
+    stopLoss: Number.isFinite(sl) && sl > 0 ? sl : null,
+  }
 }
 
 function mapServerHistoryRow(raw: Record<string, unknown>): MtServerHistoryRow | null {
@@ -326,11 +340,6 @@ function tradeResultLooksFailed(parsed: Record<string, unknown>): boolean {
   if (parsed.success === false) return true
   if (parsed.statusCode != null && Number(parsed.statusCode) >= 400) return true
   return false
-}
-
-function extractTicketFromTradeResult(parsed: Record<string, unknown>): number | null {
-  const t = Number(parsed.Ticket ?? parsed.ticket ?? parsed.order ?? parsed.Order)
-  return Number.isFinite(t) && t > 0 ? t : null
 }
 
 type MtOhlcRow = {
@@ -501,9 +510,6 @@ export function PlatformPage() {
     side: 'BUY' | 'SELL'
     symbol: string
     lotSize: number
-    entryPrice: number
-    tpPrice: number | null
-    slPrice: number | null
     openedAtIso: string
   } | null>(null)
   const pendingTradeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -973,6 +979,9 @@ export function PlatformPage() {
         const series = chart.addSeries(CandlestickSeries)
         chartRef.current = chart
         seriesRef.current = series
+        if (USE_SIGNALR_STREAM) {
+          void requestAccountSnapshotRef.current?.().catch(() => {})
+        }
 
         const onResize = () => {
           if (!containerRef.current) return
@@ -1247,6 +1256,90 @@ export function PlatformPage() {
 
     requestAccountSnapshotRef.current = requestSnapshot
 
+    const syncChartOverlayFromOpens = (opens: MtServerOpenPosition[]) => {
+      const seriesNow = seriesRef.current
+      if (!seriesNow) return
+
+      const sym = symbolRef.current.trim().toUpperCase()
+      const prev = tradeHistoryRef.current
+      const relevant = opens.filter((o) => o.symbol.trim().toUpperCase() === sym)
+
+      if (seriesNow) {
+        const strip = prev.filter(
+          (t) => t.id.startsWith('mt-') && t.symbol.trim().toUpperCase() === sym,
+        )
+        for (const t of strip) {
+          const lines = priceLinesRef.current[t.id]
+          if (lines?.entry) removeSeriesPriceLine(seriesNow, lines.entry)
+          if (lines?.tp) removeSeriesPriceLine(seriesNow, lines.tp)
+          if (lines?.sl) removeSeriesPriceLine(seriesNow, lines.sl)
+          delete priceLinesRef.current[t.id]
+        }
+      }
+
+      const mtRows: ChartTradeRow[] = relevant.map((o) => {
+        const side: 'BUY' | 'SELL' = o.type === 0 ? 'BUY' : 'SELL'
+        const tp =
+          o.takeProfit != null && o.takeProfit > 0
+            ? o.takeProfit
+            : defaultTpPrice(side, o.openPrice)
+        const sl =
+          o.stopLoss != null && o.stopLoss > 0 ? o.stopLoss : defaultSlPrice(side, o.openPrice)
+        const openedAtIso = (() => {
+          const ms = Date.parse(o.openTime)
+          return Number.isFinite(ms) ? new Date(ms).toISOString() : new Date().toISOString()
+        })()
+        return {
+          id: `mt-${o.ticket}`,
+          side,
+          symbol: o.symbol.trim().toUpperCase(),
+          lotSize: o.lots,
+          entryPrice: o.openPrice,
+          tpPrice: tp,
+          slPrice: sl,
+          openedAtIso,
+        }
+      })
+
+      const nonMt = prev.filter(
+        (t) => !(t.id.startsWith('mt-') && t.symbol.trim().toUpperCase() === sym),
+      )
+      const next = [...mtRows, ...nonMt]
+      tradeHistoryRef.current = next
+      setTradeHistory(next)
+
+      if (seriesNow) {
+        for (const row of mtRows) {
+          const entryLine = seriesNow.createPriceLine({
+            price: row.entryPrice,
+            title: `${row.side} entry`,
+            color: row.side === 'BUY' ? 'rgba(16,185,129,0.95)' : 'rgba(239,68,68,0.95)',
+            lineWidth: 2,
+            lineStyle: 0,
+            axisLabelVisible: true,
+          })
+          const tpLine = seriesNow.createPriceLine({
+            price: row.tpPrice!,
+            title: 'TP (drag)',
+            color: 'rgba(16,185,129,0.6)',
+            lineWidth: 2,
+            lineStyle: 2,
+            axisLabelVisible: true,
+          })
+          const slLine = seriesNow.createPriceLine({
+            price: row.slPrice!,
+            title: 'SL (drag)',
+            color: 'rgba(239,68,68,0.6)',
+            lineWidth: 2,
+            lineStyle: 2,
+            axisLabelVisible: true,
+          })
+          priceLinesRef.current[row.id] = { entry: entryLine, tp: tpLine, sl: slLine }
+        }
+      }
+      syncTradeLineVisuals(selectedTradeIdRef.current)
+    }
+
     const onServer = (envelope: {
       name?: string
       message?: string
@@ -1277,6 +1370,37 @@ export function PlatformPage() {
         const closed = slice.userHistory
           .map(mapServerHistoryRow)
           .filter((x): x is MtServerHistoryRow => x != null && x.symbol.length > 0)
+
+        const openTickets = new Set(opens.map((o) => o.ticket))
+        const prevChart = tradeHistoryRef.current
+        const nextChart = prevChart.filter((t) => {
+          if (!t.id.startsWith('mt-')) return true
+          const ticket = Number(t.id.slice(3))
+          if (!Number.isFinite(ticket)) return true
+          return openTickets.has(ticket)
+        })
+        if (nextChart.length !== prevChart.length) {
+          const removedIds = prevChart.filter((t) => !nextChart.some((n) => n.id === t.id)).map((t) => t.id)
+          const seriesNow = seriesRef.current
+          if (seriesNow) {
+            for (const id of removedIds) {
+              const lines = priceLinesRef.current[id]
+              if (lines?.entry) removeSeriesPriceLine(seriesNow, lines.entry)
+              if (lines?.tp) removeSeriesPriceLine(seriesNow, lines.tp)
+              if (lines?.sl) removeSeriesPriceLine(seriesNow, lines.sl)
+              delete priceLinesRef.current[id]
+            }
+          }
+          for (const id of removedIds) {
+            lastExitHitReasonRef.current.delete(id)
+          }
+          tradeHistoryRef.current = nextChart
+          setTradeHistory(nextChart)
+          setSelectedTradeId((sel) => (sel && removedIds.includes(sel) ? null : sel))
+        }
+
+        syncChartOverlayFromOpens(opens)
+
         setServerOpenPositions(opens)
         setServerHistoryRows(closed)
         return
@@ -1305,19 +1429,6 @@ export function PlatformPage() {
         if (pend) {
           pendingOpenTradeRef.current = null
           setTradeError(null)
-          const ticket = extractTicketFromTradeResult(parsed)
-          const id = ticket != null ? `mt-${ticket}` : createTradeId()
-          const row: ChartTradeRow = {
-            id,
-            side: pend.side,
-            symbol: pend.symbol,
-            lotSize: pend.lotSize,
-            entryPrice: pend.entryPrice,
-            tpPrice: pend.tpPrice,
-            slPrice: pend.slPrice,
-            openedAtIso: pend.openedAtIso,
-          }
-          appendLocalChartTradeRef.current?.(row)
         }
         void requestSnapshot().catch(() => {})
         return
@@ -1450,6 +1561,11 @@ export function PlatformPage() {
     void requestAccountSnapshotRef.current?.().catch(() => {})
   }, [platformTab])
 
+  useEffect(() => {
+    if (!USE_SIGNALR_STREAM) return
+    void requestAccountSnapshotRef.current?.().catch(() => {})
+  }, [symbol])
+
   /** Log when bid/ask hits TP or SL; trades stay open (no removal). */
   useEffect(() => {
     if (latestPrice == null) return
@@ -1522,9 +1638,6 @@ export function PlatformPage() {
         side,
         symbol: sym,
         lotSize: parsed,
-        entryPrice,
-        tpPrice,
-        slPrice,
         openedAtIso: trade.atIso,
       }
       clearPendingTradeTimer()
