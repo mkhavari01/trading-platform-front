@@ -22,15 +22,16 @@ import type {
 /** `public/metatrader.mp3` — play on open / close / TP-SL / partial (after server success where applicable). */
 const META_TRADER_SOUND_URL = '/metatrader.mp3'
 let metaTraderSoundAudio: HTMLAudioElement | null = null
-
-const VITE_SIGNALR_URL="http://46.249.99.130:5104/stream"
+const serverUrl = "http://localhost:5103"
+// const serverUrl = "http://46.249.99.130:5104"
+const VITE_SIGNALR_URL=`${serverUrl}/stream`
 const VITE_SIGNALR_ACCOUNT="5049518877"
 const VITE_SIGNALR_TERMINAL="MT5"
 const VITE_SIGNALR_SYMBOL="XAUUSD"
 const VITE_TERMINAL_TYPE="1"
 const VITE_OHLC_TIMEFRAME="1"
 const VITE_OHLC_HISTORY_DAYS="14"
-const VITE_OHLC_URL="http://46.249.99.130:5104/Manage/ohlc"
+const VITE_OHLC_URL=`${serverUrl}/Manage/ohlc`
 
 function playMetaTraderTradeSound() {
   if (typeof window === 'undefined') return
@@ -383,6 +384,7 @@ type MtServerOpenPosition = {
   openTime: string
   takeProfit: number | null
   stopLoss: number | null
+  stopLimit?: number | null
 }
 
 type MtServerHistoryRow = {
@@ -397,6 +399,51 @@ type MtServerHistoryRow = {
   closeTime: string
 }
 
+const MT_ORDER_TYPE_LABEL: Record<number, string> = {
+  0: 'Buy',
+  1: 'Sell',
+  2: 'BuyLimit',
+  3: 'SellLimit',
+  4: 'BuyStop',
+  5: 'SellStop',
+  6: 'BuyStopLimit',
+  7: 'SellStopLimit',
+  8: 'CloseBy',
+  100: 'Balance',
+  101: 'Credit',
+}
+
+function mtOrderTypeLabel(type: number): string {
+  return MT_ORDER_TYPE_LABEL[type] ?? `Type ${type}`
+}
+
+function isMarketPositionType(type: number): boolean {
+  return type === 0 || type === 1
+}
+
+function isPendingOrderType(type: number): boolean {
+  return type >= 2 && type <= 7
+}
+
+function pendingOrderTypeFromMtType(type: number): PendingOrderType | null {
+  switch (type) {
+    case 2:
+      return 'BuyLimit'
+    case 3:
+      return 'SellLimit'
+    case 4:
+      return 'BuyStop'
+    case 5:
+      return 'SellStop'
+    case 6:
+      return 'BuyStopLimit'
+    case 7:
+      return 'SellStopLimit'
+    default:
+      return null
+  }
+}
+
 function mapServerOpen(raw: Record<string, unknown>): MtServerOpenPosition | null {
   const ticket = Number(raw.Ticket ?? raw.ticket)
   if (!Number.isFinite(ticket)) return null
@@ -408,6 +455,7 @@ function mapServerOpen(raw: Record<string, unknown>): MtServerOpenPosition | nul
   const openTime = String(raw.OpenTime ?? raw.openTime ?? '')
   const tp = Number(raw.TakeProfit ?? raw.takeProfit ?? raw.Takeprofit ?? 0)
   const sl = Number(raw.StopLoss ?? raw.stopLoss ?? 0)
+  const stopLimit = Number(raw.StopLimit ?? raw.stopLimit ?? raw.Stoplimit ?? 0)
   return {
     ticket,
     symbol,
@@ -418,6 +466,7 @@ function mapServerOpen(raw: Record<string, unknown>): MtServerOpenPosition | nul
     openTime,
     takeProfit: Number.isFinite(tp) && tp > 0 ? tp : null,
     stopLoss: Number.isFinite(sl) && sl > 0 ? sl : null,
+    stopLimit: Number.isFinite(stopLimit) && stopLimit > 0 ? stopLimit : null,
   }
 }
 
@@ -433,6 +482,10 @@ function mapServerHistoryRow(raw: Record<string, unknown>): MtServerHistoryRow |
   const openTime = String(raw.OpenTime ?? raw.openTime ?? '')
   const closeTime = String(raw.CloseTime ?? raw.closeTime ?? '')
   return { ticket, symbol, lots, type, openPrice, closePrice, profit, openTime, closeTime }
+}
+
+function pendingOrderEntryLineTitle(o: MtServerOpenPosition): string {
+  return `Pending #${o.ticket} ${mtOrderTypeLabel(o.type)}`
 }
 
 /** Closed-trade chart: buy side blue, sell side orange (connector matches open side). */
@@ -686,7 +739,29 @@ export function PlatformPage() {
       }
     >
   >({})
-  const draggingRef = useRef<null | { tradeId: string; kind: 'entry' | 'tp' | 'sl' }>(null)
+  const draggingRef = useRef<null | { tradeId: string; kind: 'entry' | 'tp' | 'sl' | 'stopLimit' }>(null)
+  type PendingOrderType =
+    | 'BuyLimit'
+    | 'SellLimit'
+    | 'BuyStop'
+    | 'SellStop'
+    | 'BuyStopLimit'
+    | 'SellStopLimit'
+  type PendingDraft = {
+    orderType: PendingOrderType
+    price: number
+    stopLimit: number | null
+    takeProfit: number | null
+    stopLoss: number | null
+  }
+  const pendingOrdersEntryLinesRef = useRef<Record<number, IPriceLine>>({})
+  const pendingOrdersByTicketRef = useRef<Record<number, MtServerOpenPosition>>({})
+  const pendingLinesRef = useRef<{
+    entry?: IPriceLine
+    tp?: IPriceLine
+    sl?: IPriceLine
+    stopLimit?: IPriceLine
+  }>({})
   /** True after the pointer moved during a TP/SL (or entry-split) drag; used to skip socket on tap-only. */
   const tpSlDragMutatedRef = useRef(false)
   /** Last `setSlTp` payload per ticket until account snapshot matches (avoids chart reverting on stale opens). */
@@ -709,7 +784,7 @@ export function PlatformPage() {
     series: ISeriesApi<'Candlestick'>,
     y: number,
     hitPx: number,
-  ) => { tradeId: string; kind: 'tp' | 'sl' | 'entry' } | null
+  ) => { tradeId: string; kind: 'tp' | 'sl' | 'entry' | 'stopLimit' } | null
   const findBestPriceLineHitRef = useRef<PriceLineHitFn>((_s, _y, _h) => null)
 
   const [error, setError] = useState<string | null>(null)
@@ -729,6 +804,9 @@ export function PlatformPage() {
   const [chartUiTheme, setChartUiTheme] = useState<ChartUiTheme>(() => readStoredChartUiTheme())
   /** Closed-trade markers + connectors, and open-position markers on the candlestick chart. */
   const [showHistoryOnChart, setShowHistoryOnChart] = useState(() => readStoredHistoryOnChart())
+  const [pendingModalOpen, setPendingModalOpen] = useState(false)
+  const [pendingDraft, setPendingDraft] = useState<PendingDraft | null>(null)
+  const [pendingCancelTicket, setPendingCancelTicket] = useState('')
   const [tradeHistory, setTradeHistory] = useState<
     Array<{
       id: string
@@ -785,7 +863,52 @@ export function PlatformPage() {
     series: ISeriesApi<'Candlestick'>,
     y: number,
     hitPx: number,
-  ): { tradeId: string; kind: 'tp' | 'sl' | 'entry' } | null => {
+  ): { tradeId: string; kind: 'tp' | 'sl' | 'entry' | 'stopLimit' } | null => {
+    // Pending orders: tap/drag entry line to edit
+    {
+      let best: { ticket: number; dist: number } | null = null
+      const sym = symbolRef.current.trim().toUpperCase()
+      for (const o of Object.values(pendingOrdersByTicketRef.current)) {
+        if (o.symbol.trim().toUpperCase() !== sym) continue
+        const entryY = series.priceToCoordinate(o.openPrice)
+        if (entryY == null) continue
+        const d = Math.abs(entryY - y)
+        if (d <= hitPx && (!best || d < best.dist)) best = { ticket: o.ticket, dist: d }
+      }
+      if (best) return { tradeId: `__pending_ticket__${best.ticket}`, kind: 'entry' }
+    }
+
+    if (pendingModalOpen && pendingDraft) {
+      let best: { kind: 'entry' | 'tp' | 'sl' | 'stopLimit'; dist: number } | null = null
+      const entryY = series.priceToCoordinate(pendingDraft.price)
+      if (entryY != null) {
+        const d = Math.abs(entryY - y)
+        if (d <= hitPx) best = { kind: 'entry', dist: d }
+      }
+      if (pendingDraft.takeProfit != null) {
+        const tpY = series.priceToCoordinate(pendingDraft.takeProfit)
+        if (tpY != null) {
+          const d = Math.abs(tpY - y)
+          if (d <= hitPx && (!best || d < best.dist)) best = { kind: 'tp', dist: d }
+        }
+      }
+      if (pendingDraft.stopLoss != null) {
+        const slY = series.priceToCoordinate(pendingDraft.stopLoss)
+        if (slY != null) {
+          const d = Math.abs(slY - y)
+          if (d <= hitPx && (!best || d < best.dist)) best = { kind: 'sl', dist: d }
+        }
+      }
+      if (pendingDraft.stopLimit != null) {
+        const stopLimitY = series.priceToCoordinate(pendingDraft.stopLimit)
+        if (stopLimitY != null) {
+          const d = Math.abs(stopLimitY - y)
+          if (d <= hitPx && (!best || d < best.dist)) best = { kind: 'stopLimit', dist: d }
+        }
+      }
+      if (best) return { tradeId: '__pending__', kind: best.kind }
+    }
+
     let best: { tradeId: string; kind: 'tp' | 'sl' | 'entry'; dist: number } | null = null
     const sym = symbolRef.current.trim().toUpperCase()
     for (const t of tradeHistoryRef.current) {
@@ -855,6 +978,81 @@ export function PlatformPage() {
       })
     }
   }
+
+  const clearPendingDraftLines = () => {
+    const series = seriesRef.current
+    if (!series) return
+    const lines = pendingLinesRef.current
+    if (lines.entry) removeSeriesPriceLine(series, lines.entry)
+    if (lines.tp) removeSeriesPriceLine(series, lines.tp)
+    if (lines.sl) removeSeriesPriceLine(series, lines.sl)
+    if (lines.stopLimit) removeSeriesPriceLine(series, lines.stopLimit)
+    pendingLinesRef.current = {}
+  }
+
+  useEffect(() => {
+    const series = seriesRef.current
+    if (!pendingModalOpen || !pendingDraft || !series) {
+      if (!pendingModalOpen) clearPendingDraftLines()
+      return
+    }
+
+    const lines = pendingLinesRef.current
+    const entryOpts = {
+      title: `Pending (${pendingDraft.orderType})`,
+      color: 'rgba(250,204,21,0.95)',
+      lineWidth: 2,
+      lineStyle: 0,
+      axisLabelVisible: true,
+    } as const
+    if (lines.entry) lines.entry.applyOptions({ price: pendingDraft.price, ...entryOpts })
+    else lines.entry = series.createPriceLine({ price: pendingDraft.price, ...entryOpts })
+
+    if (pendingDraft.takeProfit != null) {
+      const tpOpts = {
+        title: 'TP (pending)',
+        color: 'rgba(16,185,129,0.7)',
+        lineWidth: 2,
+        lineStyle: 2,
+        axisLabelVisible: true,
+      } as const
+      if (lines.tp) lines.tp.applyOptions({ price: pendingDraft.takeProfit, ...tpOpts })
+      else lines.tp = series.createPriceLine({ price: pendingDraft.takeProfit, ...tpOpts })
+    } else if (lines.tp) {
+      removeSeriesPriceLine(series, lines.tp)
+      delete lines.tp
+    }
+
+    if (pendingDraft.stopLoss != null) {
+      const slOpts = {
+        title: 'SL (pending)',
+        color: 'rgba(239,68,68,0.7)',
+        lineWidth: 2,
+        lineStyle: 2,
+        axisLabelVisible: true,
+      } as const
+      if (lines.sl) lines.sl.applyOptions({ price: pendingDraft.stopLoss, ...slOpts })
+      else lines.sl = series.createPriceLine({ price: pendingDraft.stopLoss, ...slOpts })
+    } else if (lines.sl) {
+      removeSeriesPriceLine(series, lines.sl)
+      delete lines.sl
+    }
+
+    if (pendingDraft.stopLimit != null) {
+      const slmOpts = {
+        title: 'StopLimit (pending)',
+        color: 'rgba(168,85,247,0.75)',
+        lineWidth: 2,
+        lineStyle: 1,
+        axisLabelVisible: true,
+      } as const
+      if (lines.stopLimit) lines.stopLimit.applyOptions({ price: pendingDraft.stopLimit, ...slmOpts })
+      else lines.stopLimit = series.createPriceLine({ price: pendingDraft.stopLimit, ...slmOpts })
+    } else if (lines.stopLimit) {
+      removeSeriesPriceLine(series, lines.stopLimit)
+      delete lines.stopLimit
+    }
+  }, [pendingModalOpen, pendingDraft])
 
   const clearPendingTradeTimer = () => {
     const t = pendingTradeTimerRef.current
@@ -969,7 +1167,7 @@ export function PlatformPage() {
       const y = e.clientY - rect.top
       if (series.coordinateToPrice(y) == null) return
       const hit = findBestPriceLineHitRef.current(series, y, HIT_TOUCH_PX)
-      setSelectedTradeId(hit ? hit.tradeId : null)
+      setSelectedTradeId(hit && hit.tradeId !== '__pending__' ? hit.tradeId : null)
     }
 
     root.addEventListener('pointerdown', onPointerDownCapture, { capture: true })
@@ -1008,6 +1206,7 @@ export function PlatformPage() {
         const didMutate = tpSlDragMutatedRef.current
         draggingRef.current = null
         tpSlDragMutatedRef.current = false
+        if (ended?.tradeId === '__pending__') return
         if (
           didMutate &&
           USE_SIGNALR_STREAM &&
@@ -1053,7 +1252,30 @@ export function PlatformPage() {
           return
         }
 
-        setSelectedTradeId(hit.tradeId)
+        if (hit.tradeId.startsWith('__pending_ticket__')) {
+          const ticket = Number(hit.tradeId.replace('__pending_ticket__', ''))
+          const o = pendingOrdersByTicketRef.current[ticket]
+          if (o && isPendingOrderType(o.type)) {
+            const ot = pendingOrderTypeFromMtType(o.type) ?? 'BuyLimit'
+            setHistoryCloseModal(null)
+            setSelectedTradeId(null)
+            setPendingCancelTicket(String(o.ticket))
+            setPendingModalOpen(true)
+            setPendingDraft({
+              orderType: ot,
+              price: o.openPrice,
+              stopLimit: ot.includes('StopLimit') ? (o.stopLimit ?? null) : null,
+              takeProfit: o.takeProfit,
+              stopLoss: o.stopLoss,
+            })
+            draggingRef.current = { tradeId: '__pending__', kind: 'entry' }
+            tpSlDragMutatedRef.current = false
+            return
+          }
+        }
+
+        if (hit.tradeId !== '__pending__') setSelectedTradeId(hit.tradeId)
+        else setSelectedTradeId(null)
         draggingRef.current = { tradeId: hit.tradeId, kind: hit.kind }
         tpSlDragMutatedRef.current = false
         return
@@ -1067,6 +1289,29 @@ export function PlatformPage() {
       tpSlDragMutatedRef.current = true
 
       const drag = draggingRef.current
+      if (drag.tradeId === '__pending__') {
+        setPendingDraft((prev) => {
+          if (!prev) return prev
+          const next =
+            drag.kind === 'tp'
+              ? { ...prev, takeProfit: nextPrice }
+              : drag.kind === 'sl'
+                ? { ...prev, stopLoss: nextPrice }
+                : drag.kind === 'stopLimit'
+                  ? { ...prev, stopLimit: nextPrice }
+                  : { ...prev, price: nextPrice }
+          return next
+        })
+        const seriesNow = seriesRef.current
+        if (seriesNow) {
+          const lines = pendingLinesRef.current
+          if (drag.kind === 'tp') lines.tp?.applyOptions({ price: nextPrice })
+          else if (drag.kind === 'sl') lines.sl?.applyOptions({ price: nextPrice })
+          else if (drag.kind === 'stopLimit') lines.stopLimit?.applyOptions({ price: nextPrice })
+          else lines.entry?.applyOptions({ price: nextPrice })
+        }
+        return
+      }
       setTradeHistory((prev) => {
         const targetTrade = prev.find((t) => t.id === drag.tradeId)
         if (!targetTrade) return prev
@@ -1125,7 +1370,7 @@ export function PlatformPage() {
     },
     {
       target: overlayRef,
-      enabled: Boolean(selectedTradeId),
+      enabled: Boolean(selectedTradeId) || pendingModalOpen,
       eventOptions: { passive: false },
       drag: {
         filterTaps: true,
@@ -1268,14 +1513,15 @@ export function PlatformPage() {
 
     if (openForSym.length > 0) {
       for (const o of openForSym) {
+        const isMarket = isMarketPositionType(o.type)
         const isBuy = o.type === 0
-        const sideColor = isBuy ? CHART_HISTORY_BUY_COLOR : CHART_HISTORY_SELL_COLOR
+        const sideColor = !isMarket ? '#facc15' : isBuy ? CHART_HISTORY_BUY_COLOR : CHART_HISTORY_SELL_COLOR
         const tOpen = mtHistoryTimeToUtcTimestamp(o.openTime)
         if (tOpen == null) continue
         markers.push({
           time: tOpen,
           position: 'atPriceMiddle',
-          shape: isBuy ? 'arrowUp' : 'arrowDown',
+          shape: !isMarket ? 'circle' : isBuy ? 'arrowUp' : 'arrowDown',
           color: sideColor,
           price: o.openPrice,
           id: `open-${o.ticket}`,
@@ -1347,6 +1593,47 @@ export function PlatformPage() {
     })
     markersApi.setMarkers(markers)
   }, [serverHistoryRows, serverOpenPositions, symbol, platformTab, chartReady, showHistoryOnChart])
+
+  // Render ALL pending orders (types 2..7) as entry price lines on chart.
+  useEffect(() => {
+    const series = seriesRef.current
+    if (!chartReady || !series) return
+
+    const sym = symbol.trim().toUpperCase()
+    const pending = serverOpenPositions.filter(
+      (o) =>
+        o.symbol.trim().toUpperCase() === sym &&
+        isPendingOrderType(o.type) &&
+        Number.isFinite(o.openPrice) &&
+        o.openPrice > 0,
+    )
+
+    const nextByTicket: Record<number, MtServerOpenPosition> = {}
+    for (const o of pending) nextByTicket[o.ticket] = o
+    pendingOrdersByTicketRef.current = nextByTicket
+
+    const linesByTicket = pendingOrdersEntryLinesRef.current
+    for (const [k, line] of Object.entries(linesByTicket)) {
+      const ticket = Number(k)
+      if (!nextByTicket[ticket]) {
+        removeSeriesPriceLine(series, line)
+        delete linesByTicket[ticket]
+      }
+    }
+    for (const o of pending) {
+      const existing = linesByTicket[o.ticket]
+      const opts = {
+        price: o.openPrice,
+        title: pendingOrderEntryLineTitle(o),
+        color: 'rgba(250,204,21,0.85)',
+        lineWidth: 2,
+        lineStyle: 1,
+        axisLabelVisible: true,
+      } as const
+      if (existing) existing.applyOptions(opts)
+      else linesByTicket[o.ticket] = series.createPriceLine(opts)
+    }
+  }, [serverOpenPositions, symbol, chartReady])
 
   useEffect(() => {
     if (!USE_SIGNALR_STREAM) {
@@ -1596,7 +1883,7 @@ export function PlatformPage() {
 
       const sym = symbolRef.current.trim().toUpperCase()
       const prev = tradeHistoryRef.current
-      const relevant = opens.filter((o) => o.symbol.trim().toUpperCase() === sym)
+      const relevant = opens.filter((o) => o.symbol.trim().toUpperCase() === sym && isMarketPositionType(o.type))
 
       if (seriesNow) {
         const strip = prev.filter(
@@ -2107,6 +2394,87 @@ export function PlatformPage() {
       })
   }
 
+  const placePendingOrderToServer = async (draft: PendingDraft) => {
+    if (!USE_SIGNALR_STREAM) return
+    const hub = signalRConnRef.current
+    if (!hub || hub.state !== signalR.HubConnectionState.Connected) {
+      setTradeError('Not connected to the trade server.')
+      return
+    }
+    if (!lotStringHasAtMostTwoDecimalPlaces(lotSize)) {
+      setTradeError(
+        'Lot size can use at most 2 decimal places (e.g. 0.01 or 1.25). Values like 0.001 are not allowed.',
+      )
+      return
+    }
+    const parsedLots = Number(lotSize)
+    if (!Number.isFinite(parsedLots) || parsedLots <= 0) {
+      setTradeError('Lot size must be a positive number.')
+      return
+    }
+    if (!Number.isFinite(draft.price) || draft.price <= 0) {
+      setTradeError('Enter a valid pending entry price.')
+      return
+    }
+    if ((draft.orderType === 'BuyStopLimit' || draft.orderType === 'SellStopLimit') && draft.stopLimit == null) {
+      setTradeError('StopLimit orders require a stopLimit price.')
+      return
+    }
+
+    setTradeError(null)
+    const sym = symbol.trim().toUpperCase()
+    const msg: Record<string, unknown> = {
+      terminalType: SIGNALR_TERMINAL,
+      accountNumber: SIGNALR_ACCOUNT,
+      symbol: sym,
+      lots: parsedLots,
+      orderType: draft.orderType,
+      price: draft.price,
+      stopLoss:
+        draft.stopLoss != null && Number.isFinite(draft.stopLoss) && draft.stopLoss > 0 ? draft.stopLoss : 0,
+      takeProfit:
+        draft.takeProfit != null && Number.isFinite(draft.takeProfit) && draft.takeProfit > 0 ? draft.takeProfit : 0,
+    }
+    if (draft.stopLimit != null && Number.isFinite(draft.stopLimit) && draft.stopLimit > 0) {
+      msg.stopLimit = draft.stopLimit
+    }
+
+    try {
+      await hub.invoke('Server', { name: 'placePendingOrder', message: JSON.stringify(msg) })
+      playMetaTraderTradeSound()
+    } catch (e) {
+      setTradeError(e instanceof Error ? e.message : 'placePendingOrder failed')
+    }
+  }
+
+  const cancelPendingOrderToServer = async (ticketRaw: string) => {
+    if (!USE_SIGNALR_STREAM) return
+    const hub = signalRConnRef.current
+    if (!hub || hub.state !== signalR.HubConnectionState.Connected) {
+      setTradeError('Not connected to the trade server.')
+      return
+    }
+    const ticket = Number(ticketRaw.trim())
+    if (!Number.isFinite(ticket) || ticket <= 0) {
+      setTradeError('Enter a valid pending ticket number.')
+      return
+    }
+    setTradeError(null)
+    try {
+      await hub.invoke('Server', {
+        name: 'cancelPendingOrder',
+        message: JSON.stringify({
+          terminalType: SIGNALR_TERMINAL,
+          accountNumber: SIGNALR_ACCOUNT,
+          ticket,
+        }),
+      })
+      playMetaTraderTradeSound()
+    } catch (e) {
+      setTradeError(e instanceof Error ? e.message : 'cancelPendingOrder failed')
+    }
+  }
+
   const submitServerPositionClose = (mode: 'full' | 'partial') => {
     const pos = historyCloseModal
     const hub = signalRConnRef.current
@@ -2420,6 +2788,22 @@ export function PlatformPage() {
                   </svg>
                 </button>
               </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedTradeId(null)
+                  setPendingModalOpen(true)
+                  setPendingDraft((prev) => {
+                    if (prev) return prev
+                    const basePx = latestPrice ?? buyPx ?? sellPx ?? 1
+                    return { orderType: 'BuyLimit', price: basePx, stopLimit: null, takeProfit: null, stopLoss: null }
+                  })
+                }}
+                className="mt-1.5 w-full rounded-lg border border-neutral-800 bg-neutral-950/70 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-neutral-200 transition hover:bg-neutral-900 active:scale-[0.98]"
+                style={{ touchAction: 'manipulation', WebkitTapHighlightColor: 'transparent' }}
+              >
+                Pending
+              </button>
               {/* <div className="grid grid-cols-4 gap-1">
                 {(
                   [
@@ -2649,7 +3033,7 @@ export function PlatformPage() {
             position: 'absolute',
             inset: 0,
             zIndex: 5,
-            pointerEvents: selectedTradeId ? 'auto' : 'none',
+            pointerEvents: selectedTradeId || pendingModalOpen ? 'auto' : 'none',
             touchAction: 'none',
             WebkitTapHighlightColor: 'transparent',
             background: 'transparent',
@@ -3000,16 +3384,16 @@ export function PlatformPage() {
           {USE_SIGNALR_STREAM ? (
             <>
               <div style={{ marginTop: 14, fontWeight: 600, color: shell.historySectionTitle, fontSize: 13 }}>
-                Open positions (tap to close)
+                Open orders (tap: positions close / pending edit)
               </div>
               <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 8, color: shell.historyTableText }}>
                 <thead>
                   <tr style={{ textAlign: 'left', fontSize: 12, color: shell.historyMuted }}>
                     <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Ticket</th>
                     <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Symbol</th>
-                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Side</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Type</th>
                     <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Lots</th>
-                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Open</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Price</th>
                     <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>P/L</th>
                     <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Opened</th>
                   </tr>
@@ -3026,8 +3410,9 @@ export function PlatformPage() {
                       const chartSym = symbol.trim().toUpperCase()
                       const isXau = o.symbol.trim().toUpperCase() === 'XAUUSD'
                       const mid = latestPrice
+                      const canPnl = isMarketPositionType(o.type)
                       const clientPnl =
-                        isXau && chartSym === 'XAUUSD' && mid != null
+                        canPnl && isXau && chartSym === 'XAUUSD' && mid != null
                           ? xauusdOpenPnlFromMid(
                               o.type === 0 ? 'BUY' : 'SELL',
                               o.openPrice,
@@ -3035,11 +3420,26 @@ export function PlatformPage() {
                               o.lots,
                             )
                           : null
-                      const displayPnl = clientPnl != null ? clientPnl : o.profit
+                      const displayPnl = clientPnl != null ? clientPnl : canPnl ? o.profit : null
                       return (
                       <tr
                         key={o.ticket}
                         onClick={() => {
+                          if (isPendingOrderType(o.type)) {
+                            setHistoryCloseModal(null)
+                            setSelectedTradeId(null)
+                            setPendingCancelTicket(String(o.ticket))
+                            setPendingModalOpen(true)
+                            const ot = pendingOrderTypeFromMtType(o.type) ?? 'BuyLimit'
+                            setPendingDraft({
+                              orderType: ot,
+                              price: o.openPrice,
+                              stopLimit: ot.includes('StopLimit') ? (o.stopLimit ?? null) : null,
+                              takeProfit: o.takeProfit,
+                              stopLoss: o.stopLoss,
+                            })
+                            return
+                          }
                           setHistoryCloseStep('choose')
                           setPartialCloseLotsInput('')
                           setPartialCloseLotsError(null)
@@ -3052,17 +3452,17 @@ export function PlatformPage() {
                       >
                         <td style={{ padding: '8px 6px', fontSize: 12 }}>{o.ticket}</td>
                         <td style={{ padding: '8px 6px' }}>{o.symbol}</td>
-                        <td style={{ padding: '8px 6px' }}>{o.type === 0 ? 'BUY' : 'SELL'}</td>
+                        <td style={{ padding: '8px 6px' }}>{mtOrderTypeLabel(o.type)}</td>
                         <td style={{ padding: '8px 6px' }}>{o.lots}</td>
                         <td style={{ padding: '8px 6px' }}>{o.openPrice.toFixed(2)}</td>
                         <td
                           style={{
                             padding: '8px 6px',
-                            color: displayPnl >= 0 ? '#42a5f5' : '#ef5350',
+                            color: displayPnl != null && displayPnl >= 0 ? '#42a5f5' : '#ef5350',
                             fontWeight: 600,
                           }}
                         >
-                          {displayPnl.toFixed(2)}
+                          {displayPnl != null ? displayPnl.toFixed(2) : '—'}
                           {isXau && clientPnl != null ? (
                             <span style={{ fontSize: 10, fontWeight: 500, color: shell.historyMuted }}> (est.)</span>
                           ) : null}
@@ -3085,7 +3485,7 @@ export function PlatformPage() {
                   <tr style={{ textAlign: 'left', fontSize: 12, color: shell.historyMuted }}>
                     <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Ticket</th>
                     <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Symbol</th>
-                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Side</th>
+                    <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Type</th>
                     <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Lots</th>
                     <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Open</th>
                     <th style={{ padding: '8px 6px', borderBottom: `1px solid ${shell.historyThBorder}` }}>Close</th>
@@ -3105,7 +3505,7 @@ export function PlatformPage() {
                       <tr key={`${r.ticket}-${r.closeTime}`} style={{ borderBottom: `1px solid ${shell.historyRowBorder}` }}>
                         <td style={{ padding: '8px 6px', fontSize: 12 }}>{r.ticket}</td>
                         <td style={{ padding: '8px 6px' }}>{r.symbol}</td>
-                        <td style={{ padding: '8px 6px' }}>{r.type === 0 ? 'BUY' : 'SELL'}</td>
+                        <td style={{ padding: '8px 6px' }}>{mtOrderTypeLabel(r.type)}</td>
                         <td style={{ padding: '8px 6px' }}>{r.lots}</td>
                         <td style={{ padding: '8px 6px' }}>{r.openPrice.toFixed(2)}</td>
                         <td style={{ padding: '8px 6px' }}>{r.closePrice.toFixed(2)}</td>
@@ -3263,6 +3663,278 @@ export function PlatformPage() {
           )}
         </div>
       </div>
+
+      {pendingModalOpen && pendingDraft ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          style={{
+            position: 'fixed',
+            left: 0,
+            right: 0,
+            bottom: 58,
+            zIndex: 3500,
+            padding: 10,
+            pointerEvents: 'auto',
+          }}
+        >
+          <div
+            style={{
+              width: 'min(720px, 100%)',
+              margin: '0 auto',
+              borderRadius: 14,
+              border: `1px solid ${chartUiTheme === 'dark' ? '#2a2a2a' : '#d1d5db'}`,
+              background: chartUiTheme === 'dark' ? 'rgba(10,10,10,0.97)' : 'rgba(255,255,255,0.97)',
+              color: chartUiTheme === 'dark' ? '#e5e5e5' : '#0f172a',
+              boxShadow: '0 12px 30px rgba(0,0,0,0.25)',
+              padding: 12,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{ fontWeight: 800, fontSize: 13 }}>Pending order</div>
+              <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPendingModalOpen(false)
+                    draggingRef.current = null
+                    tpSlDragMutatedRef.current = false
+                  }}
+                  style={{
+                    padding: '6px 10px',
+                    borderRadius: 10,
+                    border: `1px solid ${chartUiTheme === 'dark' ? '#404040' : '#cbd5e1'}`,
+                    background: chartUiTheme === 'dark' ? '#121212' : '#f8fafc',
+                    color: chartUiTheme === 'dark' ? '#e5e5e5' : '#0f172a',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                    touchAction: 'manipulation',
+                  }}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
+              {(
+                [
+                  'BuyLimit',
+                  'SellLimit',
+                  'BuyStop',
+                  'SellStop',
+                  'BuyStopLimit',
+                  'SellStopLimit',
+                ] as const
+              ).map((ot) => {
+                const active = pendingDraft.orderType === ot
+                return (
+                  <button
+                    key={ot}
+                    type="button"
+                    onClick={() =>
+                      setPendingDraft((p) => (p ? { ...p, orderType: ot, stopLimit: ot.includes('StopLimit') ? p.stopLimit : null } : p))
+                    }
+                    style={{
+                      padding: '6px 10px',
+                      borderRadius: 10,
+                      border: `1px solid ${
+                        active ? '#1565c0' : chartUiTheme === 'dark' ? '#404040' : '#cbd5e1'
+                      }`,
+                      background: active
+                        ? 'rgba(21,101,192,0.22)'
+                        : chartUiTheme === 'dark'
+                          ? '#141414'
+                          : '#f8fafc',
+                      color: chartUiTheme === 'dark' ? '#e5e5e5' : '#0f172a',
+                      fontWeight: 700,
+                      fontSize: 12,
+                      cursor: 'pointer',
+                      touchAction: 'manipulation',
+                    }}
+                  >
+                    {ot}
+                  </button>
+                )
+              })}
+            </div>
+
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10, alignItems: 'center' }}>
+              <button
+                type="button"
+                onClick={() => {
+                  const side = pendingDraft.orderType.startsWith('Buy') ? 'BUY' : 'SELL'
+                  setPendingDraft((p) => {
+                    if (!p) return p
+                    if (p.takeProfit != null) return { ...p, takeProfit: null }
+                    return { ...p, takeProfit: defaultTpPrice(side, p.price) }
+                  })
+                }}
+                style={{
+                  padding: '7px 10px',
+                  borderRadius: 10,
+                  border: `1px solid ${pendingDraft.takeProfit != null ? '#059669' : chartUiTheme === 'dark' ? '#404040' : '#cbd5e1'}`,
+                  background:
+                    pendingDraft.takeProfit != null
+                      ? 'rgba(5,150,105,0.18)'
+                      : chartUiTheme === 'dark'
+                        ? '#141414'
+                        : '#f8fafc',
+                  color: chartUiTheme === 'dark' ? '#e5e5e5' : '#0f172a',
+                  fontWeight: 800,
+                  cursor: 'pointer',
+                  touchAction: 'manipulation',
+                }}
+              >
+                {pendingDraft.takeProfit != null ? 'TP on' : 'TP off'}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const side = pendingDraft.orderType.startsWith('Buy') ? 'BUY' : 'SELL'
+                  setPendingDraft((p) => {
+                    if (!p) return p
+                    if (p.stopLoss != null) return { ...p, stopLoss: null }
+                    return { ...p, stopLoss: defaultSlPrice(side, p.price) }
+                  })
+                }}
+                style={{
+                  padding: '7px 10px',
+                  borderRadius: 10,
+                  border: `1px solid ${pendingDraft.stopLoss != null ? '#dc2626' : chartUiTheme === 'dark' ? '#404040' : '#cbd5e1'}`,
+                  background:
+                    pendingDraft.stopLoss != null
+                      ? 'rgba(220,38,38,0.14)'
+                      : chartUiTheme === 'dark'
+                        ? '#141414'
+                        : '#f8fafc',
+                  color: chartUiTheme === 'dark' ? '#e5e5e5' : '#0f172a',
+                  fontWeight: 800,
+                  cursor: 'pointer',
+                  touchAction: 'manipulation',
+                }}
+              >
+                {pendingDraft.stopLoss != null ? 'SL on' : 'SL off'}
+              </button>
+              {pendingDraft.orderType.includes('StopLimit') ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPendingDraft((p) => {
+                      if (!p) return p
+                      if (p.stopLimit != null) return { ...p, stopLimit: null }
+                      const bump = Math.max(0.05, (latestPrice ?? p.price) * 0.0005)
+                      const isBuy = p.orderType.startsWith('Buy')
+                      return { ...p, stopLimit: Number((p.price + (isBuy ? -bump : bump)).toFixed(2)) }
+                    })
+                  }}
+                  style={{
+                    padding: '7px 10px',
+                    borderRadius: 10,
+                    border: `1px solid ${
+                      pendingDraft.stopLimit != null ? '#a855f7' : chartUiTheme === 'dark' ? '#404040' : '#cbd5e1'
+                    }`,
+                    background:
+                      pendingDraft.stopLimit != null
+                        ? 'rgba(168,85,247,0.14)'
+                        : chartUiTheme === 'dark'
+                          ? '#141414'
+                          : '#f8fafc',
+                    color: chartUiTheme === 'dark' ? '#e5e5e5' : '#0f172a',
+                    fontWeight: 800,
+                    cursor: 'pointer',
+                    touchAction: 'manipulation',
+                  }}
+                >
+                  {pendingDraft.stopLimit != null ? 'StopLimit on' : 'StopLimit off'}
+                </button>
+              ) : null}
+
+              <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  onClick={() => void placePendingOrderToServer(pendingDraft)}
+                  style={{
+                    padding: '8px 12px',
+                    borderRadius: 10,
+                    border: '1px solid #1565c0',
+                    background: '#1565c0',
+                    color: '#fff',
+                    fontWeight: 900,
+                    cursor: 'pointer',
+                    touchAction: 'manipulation',
+                  }}
+                >
+                  Place pending
+                </button>
+                {pendingCancelTicket.trim() ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const t = pendingCancelTicket.trim()
+                      void (async () => {
+                        await cancelPendingOrderToServer(t)
+                        await placePendingOrderToServer(pendingDraft)
+                      })()
+                    }}
+                    style={{
+                      padding: '8px 12px',
+                      borderRadius: 10,
+                      border: `1px solid ${chartUiTheme === 'dark' ? '#404040' : '#cbd5e1'}`,
+                      background: chartUiTheme === 'dark' ? '#141414' : '#f8fafc',
+                      color: chartUiTheme === 'dark' ? '#e5e5e5' : '#0f172a',
+                      fontWeight: 900,
+                      cursor: 'pointer',
+                      touchAction: 'manipulation',
+                    }}
+                    title="Cancel this ticket, then place the edited pending order"
+                  >
+                    Update (cancel + place)
+                  </button>
+                ) : null}
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+              <input
+                value={pendingCancelTicket}
+                onChange={(e) => setPendingCancelTicket(e.target.value)}
+                inputMode="numeric"
+                placeholder="Ticket to cancel"
+                style={{
+                  flex: '1 1 160px',
+                  minWidth: 140,
+                  padding: '8px 10px',
+                  borderRadius: 10,
+                  border: `1px solid ${chartUiTheme === 'dark' ? '#404040' : '#cbd5e1'}`,
+                  background: chartUiTheme === 'dark' ? '#0d0d0d' : '#ffffff',
+                  color: chartUiTheme === 'dark' ? '#e5e5e5' : '#0f172a',
+                  outline: 'none',
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => void cancelPendingOrderToServer(pendingCancelTicket)}
+                style={{
+                  padding: '8px 12px',
+                  borderRadius: 10,
+                  border: `1px solid ${chartUiTheme === 'dark' ? '#404040' : '#cbd5e1'}`,
+                  background: chartUiTheme === 'dark' ? '#141414' : '#f8fafc',
+                  color: chartUiTheme === 'dark' ? '#e5e5e5' : '#0f172a',
+                  fontWeight: 900,
+                  cursor: 'pointer',
+                  touchAction: 'manipulation',
+                }}
+              >
+                Cancel ticket
+              </button>
+              <div style={{ fontSize: 11, opacity: 0.75 }}>
+                Drag the lines on the chart to set entry / TP / SL (and StopLimit when enabled).
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       <div
         role="tablist"
